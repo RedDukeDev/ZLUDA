@@ -64,13 +64,11 @@ fn insert_implicit_conversions_impl<'input>(
     mut stmt: ExpandedStatement,
 ) -> Result<(), TranslateError> {
     let mut post_conv = Vec::new();
-    if let ExpandedStatement::Instruction(ast::Instruction::Tex {
-        ref mut data,
-        ref arguments,
-    }) = stmt
-    {
-        let (type_, space) = resolver.get_typed(arguments.src_ptr)?;
-        if matches!(
+    // A 64 bit register operand means the instruction addresses an object rather
+    // than a named .texref/.surfref variable.
+    let object_operand = |resolver: &GlobalStringIdentResolver2<'input>, ptr| {
+        let (type_, space) = resolver.get_typed(ptr)?;
+        Ok::<_, TranslateError>(matches!(
             (type_, space),
             (
                 ast::Type::Scalar(
@@ -78,9 +76,26 @@ fn insert_implicit_conversions_impl<'input>(
                 ),
                 ast::StateSpace::Reg
             )
-        ) {
-            data.type_ = ast::TexType::Texobj;
+        ))
+    };
+    match stmt {
+        ExpandedStatement::Instruction(ast::Instruction::Tex {
+            ref mut data,
+            ref arguments,
+        }) => {
+            if object_operand(resolver, arguments.src_ptr)? {
+                data.type_ = ast::TexType::Texobj;
+            }
         }
+        ExpandedStatement::Instruction(ast::Instruction::Sust {
+            ref mut data,
+            ref arguments,
+        }) => {
+            if object_operand(resolver, arguments.src_ptr)? {
+                data.type_ = ast::TexType::Texobj;
+            }
+        }
+        _ => {}
     }
     let statement = stmt.visit_map::<SpirvWord, TranslateError>(
         &mut |operand,
@@ -188,11 +203,12 @@ fn is_addressable(this: ast::StateSpace) -> bool {
         | ast::StateSpace::Global
         | ast::StateSpace::ParamEntry
         | ast::StateSpace::Local
-        | ast::StateSpace::Shared => true,
+        | ast::StateSpace::Shared
+        // .shared::cta is .shared with the scope written out, which sm_120 PTX
+        // always does; it coerces to generic the same way.
+        | ast::StateSpace::SharedCta => true,
         ast::StateSpace::Param | ast::StateSpace::Reg => false,
-        ast::StateSpace::SharedCluster
-        | ast::StateSpace::SharedCta
-        | ast::StateSpace::ParamFunc => todo!(),
+        ast::StateSpace::SharedCluster | ast::StateSpace::ParamFunc => todo!(),
     }
 }
 
@@ -220,15 +236,16 @@ fn default_implicit_conversion_space(
                 | ast::StateSpace::Const
                 | ast::StateSpace::Local
                 | ast::StateSpace::Shared
+                | ast::StateSpace::SharedCta
                 | ast::StateSpace::Param => Ok(Some(ConversionKind::BitToPtr)),
                 _ => Err(error_mismatched_type()),
             },
             (ast::Type::Scalar(ast::ScalarType::B32), _)
             | (ast::Type::Scalar(ast::ScalarType::U32), _)
             | (ast::Type::Scalar(ast::ScalarType::S32), _) => match instruction_space {
-                ast::StateSpace::Local | ast::StateSpace::Shared => {
-                    Ok(Some(ConversionKind::BitToPtr))
-                }
+                ast::StateSpace::Local
+                | ast::StateSpace::Shared
+                | ast::StateSpace::SharedCta => Ok(Some(ConversionKind::BitToPtr)),
                 _ => Err(error_mismatched_type()),
             },
             _ => Err(error_mismatched_type()),

@@ -253,7 +253,12 @@ fn error_unreachable() -> TranslateError {
 }
 
 #[cfg(not(debug_assertions))]
+#[track_caller]
 fn error_unreachable() -> TranslateError {
+    // Same reasoning as error_mismatched_type: many sites, one opaque code, and
+    // no backtrace in a release build. The caller's location is what makes a
+    // module that fails to translate diagnosable.
+    eprintln!("[zluda] unreachable at {}", std::panic::Location::caller());
     TranslateError::Unreachable
 }
 
@@ -293,7 +298,14 @@ fn error_mismatched_type() -> TranslateError {
 }
 
 #[cfg(not(debug_assertions))]
+#[track_caller]
 fn error_mismatched_type() -> TranslateError {
+    // Twenty-five sites raise this, and the error carries nothing that says
+    // which. A release build cannot panic with a backtrace the way the debug
+    // build does, so the caller's location is the only thing that makes a
+    // module which fails to translate diagnosable at all. It is an abort path,
+    // so the line costs nothing when things work.
+    eprintln!("[zluda] mismatched type at {}", std::panic::Location::caller());
     TranslateError::MismatchedType
 }
 
@@ -327,6 +339,9 @@ enum Statement<I, P: ast::Operand> {
         dst: SpirvWord,
         src: SpirvWord,
         type_: ast::ScalarType,
+        // .relu clamps to [0, +inf) and stops after the lower bound, .sat also
+        // applies the upper bound of 1.
+        relu: bool,
     },
 }
 
@@ -632,7 +647,12 @@ impl<T: ast::Operand<Ident = SpirvWord>> Statement<ast::Instruction<T>, T> {
                 Statement::FunctionPointer(FunctionPointerDetails { dst, src })
             }
             Statement::SetMode(mode_register) => Statement::SetMode(mode_register),
-            Statement::FpSaturate { dst, src, type_ } => {
+            Statement::FpSaturate {
+                dst,
+                src,
+                type_,
+                relu,
+            } => {
                 let dst = visitor.visit_ident(
                     dst,
                     Some((&type_.into(), ast::StateSpace::Reg)),
@@ -645,7 +665,12 @@ impl<T: ast::Operand<Ident = SpirvWord>> Statement<ast::Instruction<T>, T> {
                     false,
                     false,
                 )?;
-                Statement::FpSaturate { dst, src, type_ }
+                Statement::FpSaturate {
+                    dst,
+                    src,
+                    type_,
+                    relu,
+                }
             }
             Statement::FpModeRequired {
                 ftz_f32,
@@ -1143,6 +1168,7 @@ fn scalar_to_ptx_name(this: ast::ScalarType) -> &'static str {
         ast::ScalarType::BF16 => "bf16",
         ast::ScalarType::BF16x2 => "bf16x2",
         ast::ScalarType::Pred => "pred",
+        ast::ScalarType::E4m3 => "e4m3",
         ast::ScalarType::E4m3x2 => "e4m3x2",
         ast::ScalarType::E5m2x2 => "e5m2x2",
     }

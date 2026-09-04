@@ -259,6 +259,11 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
                     immediate_value,
                     Some((&ast::Type::Scalar(scalar_t), state_space)),
                 ),
+                // A discarded element still occupies its position in the
+                // vector, so it needs a register -- just one nothing reads.
+                ast::RegOrImmediate::Sink => Ok(self
+                    .resolver
+                    .register_unnamed(Some((ast::Type::Scalar(scalar_t), state_space)))),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let temporary_vector = self
@@ -302,6 +307,11 @@ impl<'a, 'b> ast::VisitorMap<ast::ParsedOperand<SpirvWord>, SpirvWord, Translate
             ast::ParsedOperand::VecPack(vecs) => {
                 self.vec_pack(vecs, type_space, is_dst, relaxed_type_check)
             }
+            // A discarded destination still needs somewhere to be written; an
+            // unnamed register is exactly that, and nothing reads it.
+            ast::ParsedOperand::Sink => Ok(self
+                .resolver
+                .register_unnamed(type_space.map(|(type_, space)| (type_.clone(), space)))),
         }
     }
 

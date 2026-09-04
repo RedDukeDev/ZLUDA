@@ -6,7 +6,7 @@ use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::{
     borrow::Cow,
     ffi::{CStr, CString},
@@ -14,6 +14,15 @@ use std::{
     ops::ControlFlow,
 };
 use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
+
+// Functions containing unrecognized PTX directives are dropped silently: the
+// module loads fine, but cuModuleGetFunction then cannot find them. With
+// ZLUDA_DEBUG_COMPILE set we report what was dropped and why - without it,
+// working on the PTX frontend means guessing.
+pub(crate) fn debug_compile() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZLUDA_DEBUG_COMPILE").is_some())
+}
 
 pub(crate) struct Module {
     pub(crate) base: hipModule_t,
@@ -191,6 +200,13 @@ fn get_best_ptx_and_compile(
         .try_fold(
             None,
             |acc: Option<(&Cow<'_, str>, ptx_parser::Module<'_>)>, src| {
+                if debug_compile() {
+                    if let Err(errors) = ptx_parser::parse_module_checked(src) {
+                        for e in &errors {
+                            eprintln!("[zluda] unrecognized PTX: {}", e);
+                        }
+                    }
+                }
                 let maybe_ast = if cfg!(debug_assertions) {
                     ptx_parser::parse_module_checked(src)
                 } else {
@@ -237,6 +253,14 @@ fn get_best_ptx_and_compile(
             )
         }
     };
+    if debug_compile() {
+        eprintln!(
+            "[zluda] {} PTX module(s) in image, picked sm_{} with {} invalid directive(s)",
+            ptx_modules.len(),
+            module.sm_version,
+            module.invalid_directives
+        );
+    }
     // TODO: get this information on initialization
     let hip_properties = get_hip_properties()?;
     let gcn_arch = get_gcn_arch(&hip_properties)?;
@@ -341,7 +365,31 @@ fn compile_and_cache(
         },
         |_| {},
     )
-    .map_err(|_| CUerror::UNKNOWN)?;
+    .map_err(|e| {
+        if debug_compile() {
+            eprintln!("[zluda] ptx::to_llvm_module failed: {}", e);
+        }
+        CUerror::UNKNOWN
+    })?;
+    // With ZLUDA_DUMP_IR set to a directory, the LLVM IR of every module is
+    // written there before the backend sees it.
+    //
+    // It answers questions the PTX cannot and the disassembly answers badly. An
+    // uninitialised value is spelled undef here, where in machine code it is
+    // indistinguishable from a register that happens to be read early; and how
+    // far one PTX instruction expands is plain, which is where the time goes.
+    if let Some(dir) = std::env::var_os("ZLUDA_DUMP_IR") {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = std::path::Path::new(&dir).join(format!("module_{:03}.ll", n));
+        if let Ok(mut file) = std::fs::File::create(&path) {
+            let _ = file.write_all(llvm_module.llvm_ir.print_module_to_string().to_str().as_bytes());
+        }
+    }
+
     let ptx_impl = llvm_module.linked_bitcode();
     let sm_version = llvm_module.metadata.sm_version;
     let metadata32 = llvm_module.metadata32.as_ref().map(Metadata32Bit::new);
@@ -355,7 +403,12 @@ fn compile_and_cache(
         llvm_module.metadata32,
         None,
     )
-    .map_err(|_| CUerror::UNKNOWN)?;
+    .map_err(|e| {
+        if debug_compile() {
+            eprintln!("[zluda] llvm_zluda::compile failed: {}", e);
+        }
+        CUerror::UNKNOWN
+    })?;
     if let Some((cache, key)) = cache_with_key {
         key.last_access = zluda_cache::ModuleCache::time_now();
         cache.insert_module(key, &elf_module);

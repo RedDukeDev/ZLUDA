@@ -194,6 +194,10 @@ macro_rules! from_cuda_object {
 }
 
 from_cuda_nop!(
+    // HIP describes an externally mapped mipmapped array in runtime style, with a
+    // channel format and an extent, where CUDA uses a driver style array descriptor.
+    // The two cannot be transmuted, so this one is translated by hand in driver.rs.
+    cuda_types::cuda::CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC,
     *mut i8,
     *mut i32,
     *const i32,
@@ -287,6 +291,15 @@ from_cuda_transmute!(
     cusparseIndexType_t => rocsparse_indextype,
     cusparseIndexBase_t => rocsparse_index_base,
     cusparseMatDescr_t => rocsparse_mat_descr,
+    CUsurfObject => hipSurfaceObject_t,
+    CUmipmappedArray => hipMipmappedArray_t,
+    CUexternalMemory => hipExternalMemory_t,
+    CUDA_EXTERNAL_MEMORY_HANDLE_DESC => hipExternalMemoryHandleDesc,
+    CUDA_EXTERNAL_MEMORY_BUFFER_DESC => hipExternalMemoryBufferDesc,
+    CUexternalSemaphore => hipExternalSemaphore_t,
+    CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC => hipExternalSemaphoreHandleDesc,
+    CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS => hipExternalSemaphoreSignalParams,
+    CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS => hipExternalSemaphoreWaitParams,
     CUtexObject => hipTextureObject_t,
     CUDA_RESOURCE_DESC => HIP_RESOURCE_DESC,
     CUDA_TEXTURE_DESC => HIP_TEXTURE_DESC,

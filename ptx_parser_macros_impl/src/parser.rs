@@ -154,6 +154,7 @@ impl Rule {
             result.push(DotModifier {
                 part1: part1.clone(),
                 part2: None,
+                part3: None,
             });
             let suffix_content;
             braced!(suffix_content in input);
@@ -164,13 +165,23 @@ impl Rule {
                 result.push(DotModifier {
                     part1: part1.clone(),
                     part2: Some(part2),
+                    part3: None,
                 });
             }
         } else if IdentOrTypeSuffix::peek(input) {
             let part2 = Some(IdentOrTypeSuffix::parse(input)?);
-            result.push(DotModifier { part1, part2 });
+            let part3 = if IdentOrTypeSuffix::peek(input) {
+                Some(IdentOrTypeSuffix::parse(input)?)
+            } else {
+                None
+            };
+            result.push(DotModifier { part1, part2, part3 });
         } else {
-            result.push(DotModifier { part1, part2: None });
+            result.push(DotModifier {
+                part1,
+                part2: None,
+                part3: None,
+            });
         }
         Ok(())
     }
@@ -296,6 +307,11 @@ impl Parse for MaybeDotModifier {
 pub struct DotModifier {
     part1: IdentLike,
     part2: Option<IdentOrTypeSuffix>,
+    // A third level, for modifiers such as `.mbarrier::complete_tx::bytes`.
+    // Two was enough while `.shared::cta` and `.L2::cache_hint` were the
+    // deepest names in the ISA; the bulk copy completion action goes one
+    // further.
+    part3: Option<IdentOrTypeSuffix>,
 }
 
 impl std::fmt::Display for DotModifier {
@@ -305,6 +321,10 @@ impl std::fmt::Display for DotModifier {
         if let Some(ref part2) = self.part2 {
             write!(f, "::")?;
             part2.0.fmt(f)?;
+        }
+        if let Some(ref part3) = self.part3 {
+            write!(f, "::")?;
+            part3.0.fmt(f)?;
         }
         Ok(())
     }
@@ -319,10 +339,10 @@ impl std::fmt::Debug for DotModifier {
 impl DotModifier {
     pub fn span(&self) -> Span {
         let part1 = self.part1.span();
-        if let Some(ref part2) = self.part2 {
-            part1.join(part2.span()).unwrap_or(part1)
-        } else {
-            part1
+        let last = self.part3.as_ref().or(self.part2.as_ref());
+        match last {
+            Some(part) => part1.join(part.span()).unwrap_or(part1),
+            None => part1,
         }
     }
 
@@ -331,6 +351,9 @@ impl DotModifier {
         write!(&mut result, "{}", self.part1).unwrap();
         if let Some(ref part2) = self.part2 {
             write!(&mut result, "_{}", part2.0).unwrap();
+            if let Some(ref part3) = self.part3 {
+                write!(&mut result, "_{}", part3.0).unwrap();
+            }
         } else {
             match self.part1 {
                 IdentLike::Match(_)
@@ -400,9 +423,18 @@ impl Parse for DotModifier {
         let part1 = input.parse::<IdentLike>()?;
         if IdentOrTypeSuffix::peek(input) {
             let part2 = Some(IdentOrTypeSuffix::parse(input)?);
-            Ok(Self { part1, part2 })
+            let part3 = if IdentOrTypeSuffix::peek(input) {
+                Some(IdentOrTypeSuffix::parse(input)?)
+            } else {
+                None
+            };
+            Ok(Self { part1, part2, part3 })
         } else {
-            Ok(Self { part1, part2: None })
+            Ok(Self {
+                part1,
+                part2: None,
+                part3: None,
+            })
         }
     }
 }

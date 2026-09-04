@@ -362,6 +362,38 @@ fn run_instruction<'input>(
             let name = "div_full_f32";
             to_call(resolver, fn_declarations, name.into(), i)?
         }
+        i @ ptx_parser::Instruction::Sust {
+            data:
+                ast::SustData {
+                    type_,
+                    dims,
+                    formatted,
+                    vector,
+                    scalar_type,
+                    clamp: _,
+                },
+            ..
+        } => {
+            let name = format!(
+                "{prefix}_{mode}_{dims}_{vector}{scalar}",
+                prefix = match type_ {
+                    ast::TexType::Texref => "sustref",
+                    ast::TexType::Texobj => "sustobj",
+                },
+                mode = if formatted { "p" } else { "b" },
+                dims = match dims {
+                    ast::TexDimensions::D1 => "1d",
+                    ast::TexDimensions::D2 => "2d",
+                    ast::TexDimensions::D3 => "3d",
+                },
+                vector = match vector {
+                    Some(n) => format!("v{}_", n.get()),
+                    None => String::new(),
+                },
+                scalar = scalar_to_ptx_name(scalar_type),
+            );
+            to_call(resolver, fn_declarations, name.into(), i)?
+        }
         i @ ptx_parser::Instruction::Tex {
             data:
                 ast::TexData {
@@ -369,6 +401,8 @@ fn run_instruction<'input>(
                     type_,
                     ctype,
                     dims,
+                    level,
+                    gather,
                 },
             ..
         } => {
@@ -381,8 +415,14 @@ fn run_instruction<'input>(
                 ast::TexType::Texref => "texref",
                 ast::TexType::Texobj => "texobj",
             };
+            let suffix = match (level, gather) {
+                (_, Some(component)) => ["_gather_r", "_gather_g", "_gather_b", "_gather_a"]
+                    [component as usize],
+                (true, None) => "_level",
+                (false, None) => "",
+            };
             let name = format!(
-                "{prefix}_{dims}_v4_{dtype}_{coord}",
+                "{prefix}_{dims}_v4_{dtype}_{coord}{suffix}",
                 dtype = scalar_to_ptx_name(dtype),
                 dims = match dims {
                     ast::TexDimensions::D1 => "1d",
@@ -427,6 +467,20 @@ fn run_instruction<'input>(
                 },
             ..
         } => to_call(resolver, fn_declarations, "ex2_approx_f32".into(), i)?,
+        // The hardware exp2 is scalar, so the packed forms go through a helper that
+        // does one half at a time. Without this they reach the emitter, which has no
+        // case for them and fails the whole module with an unreachable error.
+        i @ ptx_parser::Instruction::Ex2 {
+            data:
+                ast::TypeFtz {
+                    type_: type_ @ (ast::ScalarType::F16x2 | ast::ScalarType::BF16x2),
+                    ..
+                },
+            ..
+        } => {
+            let name = ["ex2_approx_", scalar_to_ptx_name(type_)].concat();
+            to_call(resolver, fn_declarations, name.into(), i)?
+        }
         i @ ptx_parser::Instruction::Lg2 {
             data: ast::FlushToZero {
                 flush_to_zero: false,
@@ -472,15 +526,16 @@ fn run_instruction<'input>(
                     blayout,
                     cd_type_scalar,
                     ab_type_scalar,
+                    k,
                 },
             ..
         } => {
             let cd_type_name = scalar_to_ptx_name(cd_type_scalar);
             let ab_type_name = scalar_to_ptx_name(ab_type_scalar);
-            let dimensions = if cd_type_scalar.kind() == ast::ScalarKind::Float {
-                "m16n8k16"
-            } else {
-                "m16n8k32"
+            let dimensions = match k {
+                8 => "m16n8k8",
+                32 => "m16n8k32",
+                _ => "m16n8k16",
             };
             let name = format!(
                 "mma_sync_aligned_{dimensions}_{}_{}_{cd_type_name}_{ab_type_name}_{ab_type_name}_{cd_type_name}",
@@ -505,6 +560,16 @@ fn run_instruction<'input>(
             ..
         } => {
             let name = "sqrt_rn_f32";
+            to_call(resolver, fn_declarations, name.into(), i)?
+        }
+        i @ ptx_parser::Instruction::WmmaMma { .. } => to_call(
+            resolver,
+            fn_declarations,
+            "wmma_mma_m16n16k16_row_col_f16_f16".into(),
+            i,
+        )?,
+        i @ ptx_parser::Instruction::MovMatrix { data, .. } => {
+            let name = ["movmatrix_m8n8_trans_", scalar_to_ptx_name(data)].concat();
             to_call(resolver, fn_declarations, name.into(), i)?
         }
         i @ ptx_parser::Instruction::Bfi { data, .. } => {
@@ -618,6 +683,31 @@ fn run_instruction<'input>(
                 i,
             )?
         }
+        // Packing a pair of halves straight into a pair of fp8 bytes. Unlike the
+        // f32 form this one carries .relu, which clamps to [0, +inf) and maps NaN to
+        // zero before converting.
+        i @ ptx_parser::Instruction::Cvt {
+            data:
+                ast::CvtDetails {
+                    from: ast::ScalarType::F16x2,
+                    to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
+                    mode: ast::CvtMode::FPTruncate { relu, .. },
+                },
+            arguments: _,
+        } => {
+            let to = match to {
+                ptx_parser::ScalarType::E4m3x2 => "e4m3x2",
+                ptx_parser::ScalarType::E5m2x2 => "e5m2x2",
+                _ => unreachable!(),
+            };
+            let relu = if relu { "relu_" } else { "" };
+            to_call(
+                resolver,
+                fn_declarations,
+                format!("cvt_rn_satfinite_{relu}{to}_f16x2").into(),
+                i,
+            )?
+        }
         i @ ptx_parser::Instruction::LdMatrix { data, .. } => {
             let shape = match data.shape {
                 ptx_parser::MatrixShape::M8n8 => "m8n8",
@@ -662,6 +752,10 @@ fn run_instruction<'input>(
     })
 }
 
+// An instruction lowered to a function that zluda_ptx_impl does not define ends up
+// dropped together with the whole kernel, and nothing is reported: the parser was
+// happy, so the unrecognized-PTX diagnostic stays silent. Listing every lowering
+// under ZLUDA_DEBUG_COMPILE makes the missing implementation findable.
 fn to_call<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     fn_declarations: &mut BTreeMap<
@@ -696,6 +790,9 @@ fn to_call<'input>(
         };
         Ok::<_, TranslateError>(())
     })?;
+    if std::env::var_os("ZLUDA_DEBUG_COMPILE").is_some() {
+        eprintln!("[zluda] lowered to __zluda_ptx_impl_{}", name);
+    }
     let fn_name =
         get_or_declare_function(resolver, fn_declarations, name, &data_return, &data_input);
     Ok(ast::Instruction::Call {

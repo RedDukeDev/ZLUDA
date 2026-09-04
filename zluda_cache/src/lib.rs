@@ -21,9 +21,24 @@ pub struct ModuleKey<'a> {
 pub struct ModuleCache(SqliteConnection);
 
 impl ModuleCache {
+    // ZLUDA_CACHE_DIR moves the cache somewhere else.
+    //
+    // Two reasons, both from working on the translation itself. Comparing two
+    // builds means the older one's entries must not answer for the newer, and
+    // the key does not tell them apart, so each needs a cache of its own.
+    // And the file is held open for as long as a process using it lives: a run
+    // that hangs in the driver leaves it locked, and then the cache cannot be
+    // emptied at all, which is how an afternoon gets spent measuring stale
+    // results.
     pub fn create_cache_dir_and_get_path() -> Option<String> {
-        let mut cache_dir = dirs::cache_dir()?;
-        cache_dir.extend(["zluda", "ComputeCache"]);
+        let mut cache_dir = match std::env::var_os("ZLUDA_CACHE_DIR") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => {
+                let mut dir = dirs::cache_dir()?;
+                dir.extend(["zluda", "ComputeCache"]);
+                dir
+            }
+        };
         // We ensure that the cache directory exists
         std::fs::create_dir_all(&cache_dir).ok()?;
         // No need to create the file, it will be created by SQLite on first access

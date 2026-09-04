@@ -192,6 +192,7 @@ pub fn map_operand<T: Copy, Err>(
             ast::ParsedOperand::RegOffset(fn_(ident, None)?.unwrap_or(ident), offset)
         }
         ast::ParsedOperand::Imm(imm) => ast::ParsedOperand::Imm(imm),
+        ast::ParsedOperand::Sink => ast::ParsedOperand::Sink,
         ast::ParsedOperand::VecMember(ident, member) => match fn_(ident, Some(member))? {
             Some(ident) => ast::ParsedOperand::Reg(ident),
             None => ast::ParsedOperand::VecMember(ident, member),
@@ -204,6 +205,7 @@ pub fn map_operand<T: Copy, Err>(
                         Ok(ast::RegOrImmediate::Reg(fn_(ident, None)?.unwrap_or(ident)))
                     }
                     ast::RegOrImmediate::Imm(imm) => Ok(ast::RegOrImmediate::Imm(imm)),
+                    ast::RegOrImmediate::Sink => Ok(ast::RegOrImmediate::Sink),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ),

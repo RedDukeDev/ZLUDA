@@ -1,5 +1,19 @@
 use crate::r#impl::hipfix;
 use hip_runtime_sys::*;
+use std::collections::HashMap;
+use std::mem;
+use std::sync::Mutex;
+
+// hipTexObjectGetResourceDesc does not fill the driver style descriptor: the
+// caller gets an uninitialised resType, which reads as a nonsense resource type
+// (0x30CE0BE0 was observed) and makes callers reject the object. DLSS calls this
+// during evaluation and refuses to proceed on the garbage it gets back.
+//
+// The descriptor is therefore remembered at creation time, exactly as
+// surf::object_create does. Only the resource type and its handle are kept:
+// those are the fields that identify the resource, and the rest of
+// HIP_RESOURCE_DESC is reserved.
+static TEXTURE_DESCS: Mutex<Option<HashMap<usize, (u32, usize)>>> = Mutex::new(None);
 
 pub(crate) unsafe fn object_create(
     p_tex_object: *mut hipTextureObject_t,
@@ -7,10 +21,56 @@ pub(crate) unsafe fn object_create(
     p_tex_desc: *const HIP_TEXTURE_DESC,
     p_res_view_desc: *const HIP_RESOURCE_VIEW_DESC,
 ) -> hipError_t {
-    hipTexObjectCreate(p_tex_object, p_res_desc, p_tex_desc, p_res_view_desc)
+    hipTexObjectCreate(p_tex_object, p_res_desc, p_tex_desc, p_res_view_desc)?;
+    if let Some(desc) = p_res_desc.as_ref() {
+        // Only the array forms carry a handle worth recording; a texture over
+        // linear or pitched memory keeps its type and reports a null resource,
+        // which is still better than the uninitialised value HIP leaves behind.
+        let handle = match desc.resType {
+            HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY => desc.res.array.hArray as usize,
+            HIPresourcetype::HIP_RESOURCE_TYPE_MIPMAPPED_ARRAY => {
+                desc.res.mipmap.hMipmappedArray as usize
+            }
+            _ => 0,
+        };
+        TEXTURE_DESCS
+            .lock()
+            .map_err(|_| hipErrorCode_t::OperatingSystem)?
+            .get_or_insert_with(HashMap::new)
+            .insert(*p_tex_object as usize, (desc.resType.0, handle));
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn object_get_resource_desc(
+    p_res_desc: *mut HIP_RESOURCE_DESC,
+    tex_object: hipTextureObject_t,
+) -> hipError_t {
+    let (res_type, handle) = *TEXTURE_DESCS
+        .lock()
+        .map_err(|_| hipErrorCode_t::OperatingSystem)?
+        .as_ref()
+        .and_then(|m| m.get(&(tex_object as usize)))
+        .ok_or(hipErrorCode_t::InvalidValue)?;
+    let desc = p_res_desc.as_mut().ok_or(hipErrorCode_t::InvalidValue)?;
+    *desc = mem::zeroed();
+    desc.resType = HIPresourcetype(res_type);
+    match desc.resType {
+        HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY => desc.res.array.hArray = handle as hipArray_t,
+        HIPresourcetype::HIP_RESOURCE_TYPE_MIPMAPPED_ARRAY => {
+            desc.res.mipmap.hMipmappedArray = handle as hipMipmappedArray_t
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) unsafe fn object_destroy(tex_object: hipTextureObject_t) -> hipError_t {
+    if let Ok(mut descs) = TEXTURE_DESCS.lock() {
+        if let Some(descs) = descs.as_mut() {
+            descs.remove(&(tex_object as usize));
+        }
+    }
     hipDestroyTextureObject(tex_object)
 }
 
@@ -1405,3 +1465,4 @@ mod tests {
         api.cuCtxDestroy_v2(ctx);
     }
 }
+

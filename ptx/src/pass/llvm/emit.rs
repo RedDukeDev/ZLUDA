@@ -240,6 +240,9 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             for statement in statements {
                 method_emitter.emit_statement(statement)?;
             }
+            // After the body, because which shared variables this kernel
+            // actually reaches is only known once it is emitted.
+            method_emitter.zero_shared_memory(real_bb)?;
             unsafe { LLVMBuildBr(method_emitter.variables_builder.get(), real_bb) };
         }
         Ok(())
@@ -314,6 +317,9 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                         ast::RegOrImmediate::Imm(imm) => {
                             Ok(get_immediate_value(self.context, scalar, imm))
                         }
+                        // The sink is a destination. An array initialiser is
+                        // not one, so this cannot be reached from valid PTX.
+                        ast::RegOrImmediate::Sink => Err(error_unreachable()),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 unsafe { LLVMConstArray2(type_, elements.as_mut_ptr(), elements.len() as u64) }
@@ -530,7 +536,12 @@ impl<'a> MethodEmitContext<'a> {
             Statement::VectorRead(vector_read) => self.emit_vector_read(vector_read)?,
             Statement::VectorWrite(vector_write) => self.emit_vector_write(vector_write)?,
             Statement::SetMode(mode_reg) => self.emit_set_mode(mode_reg)?,
-            Statement::FpSaturate { dst, src, type_ } => self.emit_fp_saturate(type_, dst, src)?,
+            Statement::FpSaturate {
+                dst,
+                src,
+                type_,
+                relu,
+            } => self.emit_fp_saturate(type_, dst, src, relu)?,
             Statement::FpModeRequired { .. } => {}
         })
     }
@@ -681,6 +692,22 @@ impl<'a> MethodEmitContext<'a> {
             }
             ast::Instruction::Sad { data, arguments } => self.emit_sad(data, arguments),
             ast::Instruction::Vshr { data, arguments } => self.emit_vshr(data, arguments),
+            ast::Instruction::MinRelu { data, arguments } => self.emit_min_relu(data, arguments),
+            ast::Instruction::RedVector { data, arguments } => {
+                self.emit_red_vector(data, arguments)
+            }
+            ast::Instruction::CpAsyncBulk { arguments } => self.emit_cp_async_bulk(arguments),
+            // Nothing to account for: the copy these describe has already
+            // happened by the time the barrier is reached.
+            ast::Instruction::MbarrierInit { .. } => Ok(()),
+            ast::Instruction::MbarrierExpectTx { .. } => Ok(()),
+            ast::Instruction::MbarrierArrive { arguments } => {
+                self.emit_mbarrier_arrive(arguments)
+            }
+            ast::Instruction::MbarrierTryWait { arguments } => {
+                self.emit_mbarrier_try_wait(arguments)
+            }
+            ast::Instruction::ElectSync { arguments } => self.emit_elect_sync(arguments),
             ast::Instruction::CpAsyncCommitGroup {} => Ok(()), // nop
             ast::Instruction::CpAsyncWaitGroup { .. } => Ok(()), // nop
             ast::Instruction::CpAsyncWaitAll { .. } => Ok(()), // nop
@@ -703,7 +730,10 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::Mma { .. }
             | ast::Instruction::Dp2a { .. }
             | ast::Instruction::Tanh { .. }
-            | ast::Instruction::Tex { .. } => return Err(error_unreachable()),
+            | ast::Instruction::Tex { .. }
+            | ast::Instruction::Sust { .. }
+            | ast::Instruction::MovMatrix { .. }
+            | ast::Instruction::WmmaMma { .. } => return Err(error_unreachable()),
         }
     }
 
@@ -1328,6 +1358,53 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    // The vector reduction, as as many atomic adds as there are words.
+    //
+    // A single wide atomic will not do: no hardware performs a sixteen byte
+    // floating point add, and LLVM rejects an atomicrmw fadd whose operand is
+    // not a floating point type -- which a packed word is not until it is seen
+    // as the pair of halves it holds. So each 32 bit lane is taken in turn, read
+    // as that pair, and added at its own address. That is exactly the packed
+    // atomic add the hardware does have.
+    fn emit_red_vector(
+        &mut self,
+        data: ptx_parser::RedVectorDetails,
+        arguments: ptx_parser::RedVectorArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let address = self.resolver.value(arguments.src_address)?;
+        let values = self.resolver.value(arguments.src_values)?;
+        let element = get_scalar_type(self.context, data.element);
+        let word_bytes = data.element.size_of() as u64;
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let i8_type = unsafe { LLVMInt8TypeInContext(self.context) };
+
+        for lane in 0..data.count {
+            let index = unsafe { LLVMConstInt(i32_type, lane as u64, 0) };
+            let word = unsafe {
+                LLVMBuildExtractElement(self.builder, values, index, LLVM_UNNAMED.as_ptr())
+            };
+            let packed = unsafe {
+                LLVMBuildBitCast(self.builder, word, element, LLVM_UNNAMED.as_ptr())
+            };
+            let mut offset = unsafe { LLVMConstInt(i32_type, lane as u64 * word_bytes, 0) };
+            let slot = unsafe {
+                LLVMBuildInBoundsGEP2(self.builder, i8_type, address, &mut offset, 1,
+                                      LLVM_UNNAMED.as_ptr())
+            };
+            unsafe {
+                LLVMZludaBuildAtomicRMW(
+                    self.builder,
+                    LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpFAdd,
+                    slot,
+                    packed,
+                    get_scope(data.scope)?,
+                    get_ordering(data.semantics),
+                )
+            };
+        }
+        Ok(())
+    }
+
     fn emit_atom_cas(
         &mut self,
         data: ast::AtomCasDetails,
@@ -1851,6 +1928,111 @@ impl<'a> MethodEmitContext<'a> {
         arguments: Vec<(LLVMValueRef, LLVMTypeRef)>,
     ) -> Result<LLVMValueRef, TranslateError> {
         self.emit_intrinsic_with_metadata(name, dst, return_types, arguments, &[])
+    }
+
+    // Diagnostic, switched on by ZLUDA_ZERO_LDS: clears the module's shared
+    // variables when a kernel starts.
+    //
+    // Why it exists: in the first kernel of the DLSS network, a block of 32
+    // threads reads 2048 bytes of its shared array and writes 1024. Whatever it
+    // reads beyond what it wrote is what the workgroup that ran there before
+    // left behind -- which differs from one run to the next, holds still within
+    // a run, and takes only a few values. That is the shape of the fault being
+    // chased, so giving that memory a known value should make the outcome
+    // repeatable, whichever way it then settles.
+    //
+    // Every thread clears the whole array rather than dividing the work up:
+    // they all write zero, so the redundancy costs only time, and it needs no
+    // condition on the thread id.
+    // Whether this function reaches the global at all, directly or through a
+    // constant expression. Clearing every shared variable in the module instead
+    // would make them all live in every kernel, and their sum is over the 64 KB
+    // a workgroup gets: the first attempt failed to compile with "local memory
+    // (69632) exceeds limit (65536)".
+    fn function_uses_global(&self, global: LLVMValueRef, depth: u32) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        unsafe {
+            let mut use_ = LLVMGetFirstUse(global);
+            while use_ != ptr::null_mut() {
+                let user = LLVMGetUser(use_);
+                if LLVMIsAInstruction(user) != ptr::null_mut() {
+                    let block = LLVMGetInstructionParent(user);
+                    if block != ptr::null_mut() && LLVMGetBasicBlockParent(block) == self.method {
+                        return true;
+                    }
+                } else if self.function_uses_global(user, depth + 1) {
+                    return true;
+                }
+                use_ = LLVMGetNextUse(use_);
+            }
+        }
+        false
+    }
+
+    fn zero_shared_memory(&mut self, entry: LLVMBasicBlockRef) -> Result<(), TranslateError> {
+        if !self.is_kernel || std::env::var_os("ZLUDA_ZERO_LDS").is_none() {
+            return Ok(());
+        }
+        // The body is already emitted, so put this in front of it: the entry
+        // block dominates everything, and the clearing has to precede every
+        // read.
+        let prologue = Builder::new_raw(self.context);
+        let first = unsafe { LLVMGetFirstInstruction(entry) };
+        unsafe {
+            if first == ptr::null_mut() {
+                LLVMPositionBuilderAtEnd(prologue.get(), entry);
+            } else {
+                LLVMPositionBuilderBefore(prologue.get(), first);
+            }
+        }
+        let restore = self.builder;
+        self.builder = prologue.get();
+        let i8_type = unsafe { LLVMInt8TypeInContext(self.context) };
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let i1_type = unsafe { LLVMInt1TypeInContext(self.context) };
+        let zero = unsafe { LLVMConstInt(i8_type, 0, 0) };
+        let not_volatile = unsafe { LLVMConstInt(i1_type, 0, 0) };
+        let mut cleared_any = false;
+        let mut global = unsafe { LLVMGetFirstGlobal(self.module) };
+        while global != ptr::null_mut() {
+            let space = unsafe { LLVMGetPointerAddressSpace(LLVMTypeOf(global)) };
+            let value_type = unsafe { LLVMGlobalGetValueType(global) };
+            let is_array =
+                unsafe { LLVMGetTypeKind(value_type) } == LLVMTypeKind::LLVMArrayTypeKind;
+            if space == 3 && is_array && self.function_uses_global(global, 0) {
+                let length = unsafe { LLVMGetArrayLength(value_type) } as u64;
+                let size = unsafe { LLVMConstInt(i32_type, length, 0) };
+                let pointer_type = unsafe { LLVMTypeOf(global) };
+                self.emit_intrinsic(
+                    c"llvm.memset.p3.i32",
+                    None,
+                    Vec::new(),
+                    vec![
+                        (global, pointer_type),
+                        (zero, i8_type),
+                        (size, i32_type),
+                        (not_volatile, i1_type),
+                    ],
+                )?;
+                cleared_any = true;
+            }
+            global = unsafe { LLVMGetNextGlobal(global) };
+        }
+        if cleared_any {
+            unsafe {
+                LLVMZludaBuildFence(
+                    self.builder,
+                    LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                    c"workgroup".as_ptr(),
+                    LLVM_UNNAMED.as_ptr(),
+                )
+            };
+            self.emit_intrinsic(c"llvm.amdgcn.s.barrier", None, Vec::new(), Vec::new())?;
+        }
+        self.builder = restore;
+        Ok(())
     }
 
     fn emit_neg(
@@ -2873,6 +3055,37 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    // min with a floor of zero: the minimum, then the larger of that and zero.
+    // Two intrinsics rather than one because no target has a single instruction
+    // for it, and this is what the hardware would do anyway.
+    fn emit_min_relu(
+        &mut self,
+        data: ptx_parser::MinReluDetails,
+        arguments: ptx_parser::MinReluArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let llvm_type = get_scalar_type(self.context, data.scalar);
+        let a = self.resolver.value(arguments.src1)?;
+        let b = self.resolver.value(arguments.src2)?;
+
+        let min_name = format!("llvm.smin.{} ", LLVMTypeDisplay(data.scalar));
+        let min = self.emit_intrinsic(
+            unsafe { CStr::from_bytes_with_nul_unchecked(min_name.as_bytes()) },
+            None,
+            vec![&data.type_],
+            vec![(a, llvm_type), (b, llvm_type)],
+        )?;
+
+        let zero = unsafe { LLVMConstInt(llvm_type, 0, 0) };
+        let max_name = format!("llvm.smax.{} ", LLVMTypeDisplay(data.scalar));
+        self.emit_intrinsic(
+            unsafe { CStr::from_bytes_with_nul_unchecked(max_name.as_bytes()) },
+            Some(arguments.dst),
+            vec![&data.type_],
+            vec![(min, llvm_type), (zero, llvm_type)],
+        )?;
+        Ok(())
+    }
+
     fn emit_min(
         &mut self,
         data: ptx_parser::MinMaxDetails,
@@ -3170,24 +3383,44 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    // .sat and .relu also apply to the packed types (f16x2, bf16x2), where the
+    // bound has to be a vector splat: LLVMConstReal only builds scalars.
+    fn fp_bound_constant(&self, type_: ast::ScalarType, value: f64) -> LLVMValueRef {
+        let llvm_type = get_scalar_type(self.context, type_);
+        match type_ {
+            ast::ScalarType::F16x2 | ast::ScalarType::BF16x2 => unsafe {
+                let element = LLVMGetElementType(llvm_type);
+                let mut elements = [LLVMConstReal(element, value); 2];
+                LLVMConstVector(elements.as_mut_ptr(), elements.len() as u32)
+            },
+            _ => unsafe { LLVMConstReal(llvm_type, value) },
+        }
+    }
+
     fn emit_fp_saturate(
         &mut self,
         type_: ast::ScalarType,
         dst: SpirvWord,
         src: SpirvWord,
+        relu: bool,
     ) -> Result<(), TranslateError> {
         let llvm_type = get_scalar_type(self.context, type_);
-        let zero = unsafe { LLVMConstReal(llvm_type, 0.0) };
-        let one = unsafe { LLVMConstReal(llvm_type, 1.0) };
+        let zero = self.fp_bound_constant(type_, 0.0);
         let maxnum_intrinsic = format!("llvm.maximumnum.{}\0", LLVMTypeDisplay(type_));
-        let minnum_intrinsic = format!("llvm.minimumnum.{}\0", LLVMTypeDisplay(type_));
         let src = self.resolver.value(src)?;
+        // llvm.maximumnum returns the operand that is not NaN, which is exactly the
+        // NaN-to-zero behaviour both .relu and the lower half of .sat ask for.
         let maxnum = self.emit_intrinsic(
             unsafe { CStr::from_bytes_with_nul_unchecked(maxnum_intrinsic.as_bytes()) },
-            None,
+            if relu { Some(dst) } else { None },
             vec![&type_.into()],
             vec![(src, llvm_type), (zero, llvm_type)],
         )?;
+        if relu {
+            return Ok(());
+        }
+        let one = self.fp_bound_constant(type_, 1.0);
+        let minnum_intrinsic = format!("llvm.minimumnum.{}\0", LLVMTypeDisplay(type_));
         self.emit_intrinsic(
             unsafe { CStr::from_bytes_with_nul_unchecked(minnum_intrinsic.as_bytes()) },
             Some(dst),
@@ -3213,6 +3446,122 @@ impl<'a> MethodEmitContext<'a> {
             vec![&type_.into()],
             vec![(src1, llvm_type), (src2, llvm_type)],
         )?;
+        Ok(())
+    }
+
+    // The bulk copy, done synchronously. See the note on the instruction's AST
+    // declaration for why that is sound; in short, the wait that follows is for
+    // a transfer that has already finished.
+    fn emit_cp_async_bulk(
+        &mut self,
+        arguments: ptx_parser::CpAsyncBulkArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let dst = self.resolver.value(arguments.src_to)?;
+        let src = self.resolver.value(arguments.src_from)?;
+        let size = self.resolver.value(arguments.src_size)?;
+        let i1 = unsafe { LLVMInt1TypeInContext(self.context) };
+        let i32_ = unsafe { LLVMInt32TypeInContext(self.context) };
+        let is_volatile = unsafe { LLVMConstInt(i1, 0, 0) };
+        let dst_type = unsafe { LLVMTypeOf(dst) };
+        let src_type = unsafe { LLVMTypeOf(src) };
+        self.emit_intrinsic(
+            c"llvm.memcpy.p3.p1.i32",
+            None,
+            Vec::new(),
+            vec![
+                (dst, dst_type),
+                (src, src_type),
+                (size, i32_),
+                (is_volatile, i1),
+            ],
+        )?;
+        Ok(())
+    }
+
+    // The arrival token is opaque and only ever handed back to try_wait, which
+    // ignores it, so any value will do.
+    fn emit_mbarrier_arrive(
+        &mut self,
+        arguments: ptx_parser::MbarrierArriveArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let i64_ = unsafe { LLVMInt64TypeInContext(self.context) };
+        let zero = unsafe { LLVMConstInt(i64_, 0, 0) };
+        self.resolver.register(arguments.dst, zero);
+        Ok(())
+    }
+
+    // Where the wait belongs. The copy was issued by one elected lane, so the
+    // block has to meet before reading what it wrote, and the predicate is then
+    // true.
+    //
+    // The fence is not decoration. s_barrier lines the waves of a workgroup up
+    // with one another but does nothing about memory still in flight: the lane
+    // that issued the copy can reach the barrier with its writes outstanding,
+    // and another wave then reads what was there before. This is the same pair
+    // that bar.sync is built from in zluda_ptx_impl.cpp -- the fence is what
+    // makes the backend wait on the counters -- and leaving it out here showed
+    // as an evaluation that came out right about three times in four and
+    // otherwise returned a flat frame, with the two outcomes each perfectly
+    // reproducible. Synchronising on the host after every launch did not change
+    // the odds, which is what placed it inside a kernel.
+    fn emit_mbarrier_try_wait(
+        &mut self,
+        arguments: ptx_parser::MbarrierTryWaitArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        unsafe {
+            LLVMZludaBuildFence(
+                self.builder,
+                LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                c"workgroup".as_ptr(),
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        self.emit_intrinsic(c"llvm.amdgcn.s.barrier", None, Vec::new(), Vec::new())?;
+        let i1 = unsafe { LLVMInt1TypeInContext(self.context) };
+        let true_ = unsafe { LLVMConstInt(i1, 1, 0) };
+        self.resolver.register(arguments.dst, true_);
+        Ok(())
+    }
+
+    // Elects the active lane with the lowest id. Picking lane zero would be
+    // wrong: this runs under divergent control flow, where lane zero need not
+    // be active, and then nothing would be elected and no copy would happen.
+    fn emit_elect_sync(
+        &mut self,
+        arguments: ptx_parser::ElectSyncArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let i1 = unsafe { LLVMInt1TypeInContext(self.context) };
+        let i32_ = unsafe { LLVMInt32TypeInContext(self.context) };
+        // These three return a value, so their return type has to be declared:
+        // building them as void makes LLVM reject the module with "Intrinsic
+        // has incorrect return type".
+        let b32 = ast::Type::Scalar(ast::ScalarType::B32);
+        let true_ = unsafe { LLVMConstInt(i1, 1, 0) };
+        let mask = self.emit_intrinsic(
+            c"llvm.amdgcn.ballot.i32",
+            None,
+            vec![&b32],
+            vec![(true_, i1)],
+        )?;
+        let false_ = unsafe { LLVMConstInt(i1, 0, 0) };
+        let leader = self.emit_intrinsic(
+            c"llvm.cttz.i32",
+            None,
+            vec![&b32],
+            vec![(mask, i32_), (false_, i1)],
+        )?;
+        let all_ones = unsafe { LLVMConstInt(i32_, u64::MAX, 0) };
+        let zero = unsafe { LLVMConstInt(i32_, 0, 0) };
+        let lane = self.emit_intrinsic(
+            c"llvm.amdgcn.mbcnt.lo",
+            None,
+            vec![&b32],
+            vec![(all_ones, i32_), (zero, i32_)],
+        )?;
+        self.resolver.register(arguments.dst, lane);
+        self.resolver.with_result(arguments.dst_pred, |dst| unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, lane, leader, dst)
+        });
         Ok(())
     }
 
@@ -4067,7 +4416,10 @@ impl std::fmt::Display for LLVMTypeDisplay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
             ast::ScalarType::Pred => write!(f, "i1"),
-            ast::ScalarType::B8 | ast::ScalarType::U8 | ast::ScalarType::S8 => write!(f, "i8"),
+            ast::ScalarType::B8
+            | ast::ScalarType::U8
+            | ast::ScalarType::S8
+            | ast::ScalarType::E4m3 => write!(f, "i8"),
             ast::ScalarType::B16
             | ast::ScalarType::U16
             | ast::ScalarType::S16

@@ -846,3 +846,119 @@ mod tests {
         assert_eq!(dark_ctx.0, primary_ctx.0);
     }
 }
+
+// Sharing resources with a graphics API. HIP mirrors the CUDA driver API here
+// field for field and value for value - the descriptor layouts and the handle type
+// enums were compared before wiring these as plain forwards.
+//
+// A probe confirmed the path works end to end on this hardware: a Vulkan image
+// exported as a dma-buf, imported here, mapped to a mipmapped array and turned into
+// a surface object. The external semaphores are forwarded too, but ROCm does not
+// import Vulkan semaphores yet and reports it, which is better than pretending the
+// call is unsupported at this level.
+
+pub(crate) unsafe fn import_external_memory(
+    ext_mem_out: *mut hipExternalMemory_t,
+    mem_handle_desc: *const hipExternalMemoryHandleDesc,
+) -> hipError_t {
+    hipImportExternalMemory(ext_mem_out, mem_handle_desc)
+}
+
+pub(crate) unsafe fn external_memory_get_mapped_buffer(
+    dev_ptr: &mut hipDeviceptr_t,
+    ext_mem: hipExternalMemory_t,
+    buffer_desc: *const hipExternalMemoryBufferDesc,
+) -> hipError_t {
+    hipExternalMemoryGetMappedBuffer(ptr::from_mut(dev_ptr).cast(), ext_mem, buffer_desc)
+}
+
+// The one descriptor HIP does not mirror: CUDA describes the base level with a
+// driver style array descriptor, HIP with a runtime style channel format plus an
+// extent, so this one is translated field by field.
+pub(crate) unsafe fn external_memory_get_mapped_mipmapped_array(
+    mipmap: *mut hipMipmappedArray_t,
+    ext_mem: hipExternalMemory_t,
+    mipmap_desc: &CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC,
+) -> hipError_t {
+    let array = &mipmap_desc.arrayDesc;
+    let (bits, kind) = match array.Format {
+        CUarray_format::CU_AD_FORMAT_UNSIGNED_INT8 => (8, hipChannelFormatKind::hipChannelFormatKindUnsigned),
+        CUarray_format::CU_AD_FORMAT_UNSIGNED_INT16 => (16, hipChannelFormatKind::hipChannelFormatKindUnsigned),
+        CUarray_format::CU_AD_FORMAT_UNSIGNED_INT32 => (32, hipChannelFormatKind::hipChannelFormatKindUnsigned),
+        CUarray_format::CU_AD_FORMAT_SIGNED_INT8 => (8, hipChannelFormatKind::hipChannelFormatKindSigned),
+        CUarray_format::CU_AD_FORMAT_SIGNED_INT16 => (16, hipChannelFormatKind::hipChannelFormatKindSigned),
+        CUarray_format::CU_AD_FORMAT_SIGNED_INT32 => (32, hipChannelFormatKind::hipChannelFormatKindSigned),
+        CUarray_format::CU_AD_FORMAT_HALF => (16, hipChannelFormatKind::hipChannelFormatKindFloat),
+        CUarray_format::CU_AD_FORMAT_FLOAT => (32, hipChannelFormatKind::hipChannelFormatKindFloat),
+        _ => return Err(hipErrorCode_t::NotSupported),
+    };
+    let channels = array.NumChannels;
+    let mut desc: hipExternalMemoryMipmappedArrayDesc = mem::zeroed();
+    desc.offset = mipmap_desc.offset;
+    desc.formatDesc = hipChannelFormatDesc {
+        x: bits,
+        y: if channels > 1 { bits } else { 0 },
+        z: if channels > 2 { bits } else { 0 },
+        w: if channels > 3 { bits } else { 0 },
+        f: kind,
+    };
+    desc.extent = hipExtent {
+        width: array.Width,
+        height: array.Height,
+        depth: array.Depth,
+    };
+    desc.flags = array.Flags;
+    desc.numLevels = mipmap_desc.numLevels;
+    hipExternalMemoryGetMappedMipmappedArray(mipmap, ext_mem, &desc)
+}
+
+pub(crate) unsafe fn destroy_external_memory(ext_mem: hipExternalMemory_t) -> hipError_t {
+    hipDestroyExternalMemory(ext_mem)
+}
+
+pub(crate) unsafe fn import_external_semaphore(
+    ext_sem_out: *mut hipExternalSemaphore_t,
+    sem_handle_desc: *const hipExternalSemaphoreHandleDesc,
+) -> hipError_t {
+    hipImportExternalSemaphore(ext_sem_out, sem_handle_desc)
+}
+
+pub(crate) unsafe fn signal_external_semaphores_async(
+    ext_sem_array: *const hipExternalSemaphore_t,
+    params_array: *const hipExternalSemaphoreSignalParams,
+    num_ext_sems: ::core::ffi::c_uint,
+    stream: hipStream_t,
+) -> hipError_t {
+    hipSignalExternalSemaphoresAsync(ext_sem_array, params_array, num_ext_sems, stream)
+}
+
+pub(crate) unsafe fn wait_external_semaphores_async(
+    ext_sem_array: *const hipExternalSemaphore_t,
+    params_array: *const hipExternalSemaphoreWaitParams,
+    num_ext_sems: ::core::ffi::c_uint,
+    stream: hipStream_t,
+) -> hipError_t {
+    hipWaitExternalSemaphoresAsync(ext_sem_array, params_array, num_ext_sems, stream)
+}
+
+pub(crate) unsafe fn destroy_external_semaphore(ext_sem: hipExternalSemaphore_t) -> hipError_t {
+    hipDestroyExternalSemaphore(ext_sem)
+}
+
+// The mipmapped array itself. DLSS resolves cuMipmappedArrayDestroy in its function
+// table, and getting level zero is how an imported array becomes something a surface
+// or texture object can be built on.
+
+pub(crate) unsafe fn mipmapped_array_get_level(
+    p_level_array: *mut hipArray_t,
+    h_mipmapped_array: hipMipmappedArray_t,
+    level: ::core::ffi::c_uint,
+) -> hipError_t {
+    hipMipmappedArrayGetLevel(p_level_array, h_mipmapped_array, level)
+}
+
+pub(crate) unsafe fn mipmapped_array_destroy(
+    h_mipmapped_array: hipMipmappedArray_t,
+) -> hipError_t {
+    hipMipmappedArrayDestroy(h_mipmapped_array)
+}

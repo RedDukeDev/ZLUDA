@@ -85,6 +85,8 @@ then cd to the directory with this file and run this simple command:
 #define CONSTANT_SPACE __attribute__((address_space(4)))
 
 typedef unsigned int v2u32 __attribute__((ext_vector_type(2)));
+typedef unsigned short v2u16 __attribute__((ext_vector_type(2)));
+typedef unsigned char v4u8 __attribute__((ext_vector_type(4)));
 typedef int s32;
 typedef int v1s32 __attribute__((ext_vector_type(1)));
 typedef int v2s32 __attribute__((ext_vector_type(2)));
@@ -105,6 +107,10 @@ typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
 typedef __bf16 bf16x4 __attribute__((ext_vector_type(4)));
 typedef __bf16 bf16x8 __attribute__((ext_vector_type(8)));
 typedef char s8x4 __attribute__((ext_vector_type(4)));
+// Four e4m3 bytes to a 32 bit register, packed exactly as s8x4 packs four s8.
+// Every 8 bit m16n8k32 form shares one fragment layout, so this rides the same
+// generic fallback; only the dot product reads the bytes differently.
+typedef unsigned char e4m3x4 __attribute__((ext_vector_type(4)));
 
 #define FUNC(NAME) __device__ __attribute__((retain)) __zluda_ptx_impl_##NAME
 #define FUNC_CALL(NAME) __zluda_ptx_impl_##NAME
@@ -425,6 +431,22 @@ extern "C"
 
     // When x = -126, exp2(x) = 2^(-126) ≈ 1.175494351 × 10^(-38),
     // which is the smallest normalized number in FP32
+    // ex2 on a packed pair. The hardware instruction is scalar, so each element
+    // goes through it separately, widened to float and rounded once on the way back.
+    // Half precision tops out well inside the normal range of float, so the
+    // underflow handling the f32 helper needs is not required here.
+    f16x2 FUNC(ex2_approx_f16x2)(f16x2 x)
+    {
+        return f16x2{f16(__builtin_amdgcn_exp2f(float(x.x))),
+                     f16(__builtin_amdgcn_exp2f(float(x.y)))};
+    }
+
+    bf16x2 FUNC(ex2_approx_bf16x2)(bf16x2 x)
+    {
+        return bf16x2{bf16(__builtin_amdgcn_exp2f(float(x.x))),
+                      bf16(__builtin_amdgcn_exp2f(float(x.y)))};
+    }
+
     float FUNC(ex2_approx_f32)(float x)
     {
         bool special_handling = x < -126.0f;
@@ -688,6 +710,96 @@ extern "C"
         return {cvt_float_to_fp8(b, __HIP_E5M2), cvt_float_to_fp8(a, __HIP_E5M2)};
     }
 
+    // The low half of the source lands in the low byte of the result, matching the
+    // f32 form where the second operand takes the low byte. .relu clamps to
+    // [0, +inf) first; the comparison is false for NaN, so NaN maps to zero as PTX
+    // requires.
+    __device__ static Fp8x2 cvt_f16x2_to_fp8x2(f16x2 in, __hip_fp8_interpretation_t interp, bool relu)
+    {
+        float low = float(in.x);
+        float high = float(in.y);
+        if (relu)
+        {
+            low = low > 0.0f ? low : 0.0f;
+            high = high > 0.0f ? high : 0.0f;
+        }
+        return {cvt_float_to_fp8(low, interp), cvt_float_to_fp8(high, interp)};
+    }
+
+    // The same conversion as cvt_f16x2_to_fp8x2 for e4m3 without relu, bit for
+    // bit, but without going by way of float and a software routine twice.
+    //
+    // It earns a path of its own by being the most frequent expensive
+    // instruction in the network: an instruction census of the busiest DLSS
+    // kernel counts 324 of these against 288 matrix multiplies.
+    //
+    // tools/f16_to_e4m3_check.cpp compares it against the general routine over
+    // all 65536 f16 values, in both halves. Matching exactly is the point -- a
+    // conversion that were merely as accurate would move the network's output
+    // for reasons that would be very hard to trace later.
+    __device__ static inline Fp8x2 cvt_f16x2_to_e4m3x2(f16x2 in)
+    {
+        const uint32_t bits = std::bit_cast<uint32_t>(in);
+        const uint32_t magnitude = bits & 0x7FFF7FFFu;
+        // Infinity and NaN alike come out as e4m3's NaN, which is what the
+        // general routine does. Adding 0x400 carries into bit 15 for exactly
+        // those, and cannot carry out of its own half.
+        const uint32_t is_special = (magnitude + 0x04000400u) & 0x80008000u;
+
+        const f16x2 mag = std::bit_cast<f16x2>(magnitude);
+
+        // Where the answer is a normal e4m3, multiplying by 2^-8 is exact and
+        // the encoding is the top seven bits of what comes out.
+        const uint32_t scaled = std::bit_cast<uint32_t>(mag * f16(0.00390625f));
+        // Round to nearest even while dropping the seven low mantissa bits.
+        const uint32_t rounded = scaled + 0x003F003Fu + ((scaled >> 7) & 0x00010001u);
+
+        // Where the answer is a denormal, that would round once in the multiply
+        // and again in the shift, and double rounding gets 84 of the 65536
+        // values wrong. Denormals are whole multiples of 2^-9, so round straight
+        // to that step instead: an f16 near two has its last bit worth exactly
+        // 2^-9, so adding two and taking it away again leaves the multiple. The
+        // multiple is the encoding, and where it comes to eight that is the
+        // smallest normal, whose encoding is eight as well.
+        const f16x2 two = {f16(2.0f), f16(2.0f)};
+        const f16x2 stepped = ((mag + two) - two) * f16(512.0f);
+
+        // 0x2400 is 2^-6, the smallest normal e4m3.
+        // Straight from f16 to an integer. Going by way of float cost a
+        // v_cvt_f32_f16 on every conversion -- 1541 of them in one kernel of
+        // the network -- for a value that is always a whole number under nine.
+        uint32_t low = (magnitude & 0xFFFFu) < 0x2400u ? uint32_t(stepped.x)
+                                                       : (rounded & 0xFFFFu) >> 7;
+        uint32_t high = (magnitude >> 16) < 0x2400u ? uint32_t(stepped.y) : rounded >> 23;
+        if (low > 0x7Eu) low = 0x7Eu;
+        if (high > 0x7Eu) high = 0x7Eu;
+        if (is_special & 0x00008000u) low = 0x7Fu;
+        if (is_special & 0x80000000u) high = 0x7Fu;
+        low |= (bits >> 8) & 0x80u;
+        high |= (bits >> 24) & 0x80u;
+        return {__hip_fp8_storage_t(low), __hip_fp8_storage_t(high)};
+    }
+
+    Fp8x2 FUNC(cvt_rn_satfinite_e4m3x2_f16x2)(f16x2 in)
+    {
+        return cvt_f16x2_to_e4m3x2(in);
+    }
+
+    Fp8x2 FUNC(cvt_rn_satfinite_relu_e4m3x2_f16x2)(f16x2 in)
+    {
+        return cvt_f16x2_to_fp8x2(in, __HIP_E4M3, true);
+    }
+
+    Fp8x2 FUNC(cvt_rn_satfinite_e5m2x2_f16x2)(f16x2 in)
+    {
+        return cvt_f16x2_to_fp8x2(in, __HIP_E5M2, false);
+    }
+
+    Fp8x2 FUNC(cvt_rn_satfinite_relu_e5m2x2_f16x2)(f16x2 in)
+    {
+        return cvt_f16x2_to_fp8x2(in, __HIP_E5M2, true);
+    }
+
     __half2 FUNC(cvt_rn_f16x2_e4m3x2)(__hip_fp8x2_e4m3 in)
     {
         return in;
@@ -789,6 +901,28 @@ extern "C"
         uint32_t address_hi = (uint32_t)row_address_hi + ((laneid / 4) * 2);
         uint16_t hi = *((uint16_t SHARED_SPACE *)address_hi);
         return std::bit_cast<uint32_t>(ushort2::Native_vec_{lo, hi});
+    }
+
+    // movmatrix transposes the 8x8 b16 matrix the warp holds, one register per lane.
+    //
+    // The layout is the one load_single_matrix above produces: lane L holds row L/4,
+    // columns 2*(L%4) and 2*(L%4)+1, low half first. After transposing, lane L must
+    // hold M[2*(L%4)][L/4] and M[2*(L%4)+1][L/4] - the same values that
+    // load_single_matrix_trans reads straight from memory, which is what the test
+    // for this checks. Element M[r][c] lives in lane 4*r + c/2, half c%2.
+    uint32_t FUNC(movmatrix_m8n8_trans_b16)(uint32_t src)
+    {
+        uint32_t laneid = FUNC_CALL(sreg_laneid)();
+        uint32_t column = laneid / 4;         // the column this lane ends up owning
+        uint32_t row = (laneid % 4) * 2;      // first of the two rows it takes
+        uint32_t half = column % 2;           // which half of the source register
+        int32_t low_source = __builtin_amdgcn_ds_bpermute(
+            (int32_t)((row * 4 + column / 2) << 2), (int32_t)src);
+        int32_t high_source = __builtin_amdgcn_ds_bpermute(
+            (int32_t)(((row + 1) * 4 + column / 2) << 2), (int32_t)src);
+        uint16_t low = (uint16_t)(((uint32_t)low_source >> (half * 16)) & 0xFFFFu);
+        uint16_t high = (uint16_t)(((uint32_t)high_source >> (half * 16)) & 0xFFFFu);
+        return std::bit_cast<uint32_t>(ushort2::Native_vec_{low, high});
     }
 
     uint2::Native_vec_ FUNC(ldmatrix_m8n8_x2_b16)(void SHARED_SPACE *address)
@@ -946,6 +1080,29 @@ __device__ float dot_product<float, f16x2>(float initial_value, f16x2 row[8], f1
 }
 
 // Template function because DPP mask must be a compile time constant
+__device__ static float e4m3_to_float(unsigned char raw)
+{
+    return float(__half(__hip_cvt_fp8_to_halfraw(__hip_fp8_storage_t(raw), __HIP_E4M3)));
+}
+
+// RDNA3 has no FP8 matrix instruction -- those arrived with RDNA4/gfx1200 -- so
+// the products are taken in f32 after widening each byte. Accumulating in float
+// and rounding once at the end is if anything more accurate than the hardware,
+// which is the same trade the f16 accumulator path already makes.
+template <>
+__device__ float dot_product<float, e4m3x4>(float initial_value, e4m3x4 row[8], e4m3x4 column[8])
+{
+    float result = initial_value;
+    for (int i = 0; i < 8; i++)
+    {
+        result = __builtin_fmaf(e4m3_to_float(row[i].x), e4m3_to_float(column[i].x), result);
+        result = __builtin_fmaf(e4m3_to_float(row[i].y), e4m3_to_float(column[i].y), result);
+        result = __builtin_fmaf(e4m3_to_float(row[i].z), e4m3_to_float(column[i].z), result);
+        result = __builtin_fmaf(e4m3_to_float(row[i].w), e4m3_to_float(column[i].w), result);
+    }
+    return result;
+}
+
 template <typename T, const int DPP_MASK>
 __device__ static void mma_load_rowcol(T upper_row[8], T lower_row[8], T left_column[8], T right_column[8],
                                        int index, int left_column_start,
@@ -1036,9 +1193,78 @@ __device__ HIP_vector_base<Acc, 4>::Native_vec_ fallback_mma_sync_aligned(uint4:
 
 extern "C"
 {
+    // We wrap the intrinsic in an optnone function to prevent ZLUDA-specific
+    // passes from optimizing away the intrinsic call
+    static __device__ float4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone [[clang::optnone]] (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
+    {
+        __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg) __asm("llvm.zluda.mma.m16n8k16.f32.f16.f16.f32");
+        return std::bit_cast<float4::Native_vec_>(__llvm_zluda_mma_m16n8k16_f32_f16_f16_f32(a_reg, b_reg, std::bit_cast<uint4::Native_vec_>(c_reg)));
+    }
+
     float4::Native_vec_ FUNC(mma_sync_aligned_m16n8k16_row_col_f32_f16_f16_f32)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
     {
-        return fallback_mma_sync_aligned<float, f16x2>(a_reg, b_reg, HIP_vector_base<float, 4>(c_reg.x, c_reg.y, c_reg.z, c_reg.w));
+        // The fork already declares this intrinsic and lowers it to the native RDNA3
+        // WMMA, exactly as the bf16 form below does; nothing was routed through it.
+        // It matters well beyond speed: without it every mma expands to the software
+        // fallback inline, and a DLSS module with a thousand of them takes minutes to
+        // compile.
+        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 12000)
+        {
+            [[clang::always_inline]] return __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a_reg, b_reg, c_reg);
+        }
+        else
+        {
+            return fallback_mma_sync_aligned<float, f16x2>(a_reg, b_reg, HIP_vector_base<float, 4>(c_reg.x, c_reg.y, c_reg.z, c_reg.w));
+        }
+    }
+
+    // Same shape, but C and D arrive as four halves packed into two 32 bit
+    // registers. Widen to float, reuse the shared fallback, round once on the way
+    // out. NVIDIA accumulates in half here, so this is if anything more accurate.
+    uint2::Native_vec_ FUNC(mma_sync_aligned_m16n8k16_row_col_f16_f16_f16_f16)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint2::Native_vec_ c_reg)
+    {
+        f16x2 c01 = std::bit_cast<f16x2>(c_reg[0]);
+        f16x2 c23 = std::bit_cast<f16x2>(c_reg[1]);
+        float4::Native_vec_ d = FUNC_CALL(mma_sync_aligned_m16n8k16_row_col_f32_f16_f16_f32)(
+            a_reg, b_reg,
+            float4::Native_vec_{float(c01.x), float(c01.y), float(c23.x), float(c23.y)});
+        f16x2 d01 = {f16(d.x), f16(d.y)};
+        f16x2 d23 = {f16(d.z), f16(d.w)};
+        return {std::bit_cast<uint32_t>(d01), std::bit_cast<uint32_t>(d23)};
+    }
+
+    // m16n8k8 shares the fragment layout of m16n8k16 restricted to k = 0..7: its
+    // two A registers and single B register are exactly the first ones of the k16
+    // fragments, and the rest cover k = 8..15. Zeroing those contributes nothing to
+    // the sum, so this reduces to the k16 path that is already covered by a test.
+    uint2::Native_vec_ FUNC(mma_sync_aligned_m16n8k8_row_col_f16_f16_f16_f16)(uint2::Native_vec_ a_reg, v1s32 b_reg, uint2::Native_vec_ c_reg)
+    {
+        uint4::Native_vec_ a_k16 = {a_reg[0], a_reg[1], 0u, 0u};
+        uint2::Native_vec_ b_k16 = {(uint32_t)b_reg[0], 0u};
+        return FUNC_CALL(mma_sync_aligned_m16n8k16_row_col_f16_f16_f16_f16)(a_k16, b_k16, c_reg);
+    }
+
+    // wmma.mma.m16n16k16.f16.f16 is, on the architecture this PTX targets, exactly two
+    // HMMA.16816.F16 - the same hardware operation mma.sync.m16n8k16 lowers to. The
+    // fragment layout is deliberately unspecified in the PTX ISA, so this was derived
+    // by compiling the instruction with NVIDIA's own ptxas for sm_89 and reading the
+    // SASS: both halves take a[0..3] as A, the first takes b[0..1] with c[0..1] and
+    // the second b[2..3] with c[2..3]. Registers a[4..7] and b[4..7] never reach an
+    // HMMA operand, which the same experiment confirms by keeping them live and
+    // watching them go unused, so they are ignored here too.
+    uint4::Native_vec_ FUNC(wmma_mma_m16n16k16_row_col_f16_f16)(v8s32 a, v8s32 b, v4s32 c)
+    {
+        uint4::Native_vec_ a_fragment = {(uint32_t)a[0], (uint32_t)a[1],
+                                         (uint32_t)a[2], (uint32_t)a[3]};
+        uint2::Native_vec_ b_first = {(uint32_t)b[0], (uint32_t)b[1]};
+        uint2::Native_vec_ b_second = {(uint32_t)b[2], (uint32_t)b[3]};
+        uint2::Native_vec_ c_first = {(uint32_t)c[0], (uint32_t)c[1]};
+        uint2::Native_vec_ c_second = {(uint32_t)c[2], (uint32_t)c[3]};
+        uint2::Native_vec_ d_first =
+            FUNC_CALL(mma_sync_aligned_m16n8k16_row_col_f16_f16_f16_f16)(a_fragment, b_first, c_first);
+        uint2::Native_vec_ d_second =
+            FUNC_CALL(mma_sync_aligned_m16n8k16_row_col_f16_f16_f16_f16)(a_fragment, b_second, c_second);
+        return {d_first[0], d_first[1], d_second[0], d_second[1]};
     }
 
     // We wrap the intrinsic in an optnone function to prevent ZLUDA-specific
@@ -1076,6 +1302,135 @@ extern "C"
             [[clang::always_inline]] return __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32_optnone(a_reg, b_reg, c_reg);
         }
         return std::bit_cast<uint4::Native_vec_>(fallback_mma_sync_aligned<int32_t, s8x4>(a_reg, b_reg, std::bit_cast<HIP_vector_base<int32_t, 4>>(c_reg)));
+    }
+
+    // FP8 inputs, f16 accumulator. Used by the DLSS ray reconstruction kernels,
+    // which are the only ones in the shipped DLL that reach for FP8 at all.
+    //
+    // There is deliberately no native branch here yet. RDNA4 does have
+    // v_wmma_f32_16x16x16_fp8_fp8, and a runtime test on __oclc_ISA_version folds
+    // away at compile time the way the gfx11 branches above do, so the gate would
+    // work. What is missing is the mapping: PTX m16n8k32 carries sixteen A bytes
+    // per lane over eight columns, the AMD instruction eight bytes over sixteen,
+    // so pairs of PTX operations have to be fused the way CombineMMA.cpp already
+    // fuses the f16 ones. That pass has no FP8 case, and no gfx12 hardware was
+    // available to verify a fragment mapping against -- an unverified one would
+    // compile and silently produce wrong pixels. Today every MMA falls back to
+    // software on gfx12 regardless; when a native gfx12 path is added, FP8 slots
+    // in at the same gate as the rest.
+// Widening an FP8 matrix multiply onto the hardware f16 one.
+//
+// RDNA3's matrix units take f16, bf16 and 8 bit integers, but not e4m3, so the
+// FP8 product falls to software: thirty-two scalar multiply-adds per lane per
+// instruction. Measured on one DLSS evaluation, kernels using it were a hundred
+// per cent of the time.
+//
+// e4m3 is exactly representable in f16 -- four exponent bits and three of
+// mantissa against five and ten -- so widening loses nothing, and one product
+// over k=32 becomes two over k=16 on the hardware unit.
+//
+// The fiddly part is that the two instructions give different k values to
+// different lanes. Writing t for a lane's position in its quad, the 8 bit form
+// hands lane t the four values k = 4t..4t+3, while the 16 bit form wants
+// k = 2t, 2t+1 and k = 2t+8, 2t+9. Those live in lanes t/2 and t/2+2, so each
+// half has to be gathered across the quad before it can be used. The
+// accumulator needs no such treatment: both forms lay C and D out the same way.
+//
+// Both gathers are fixed permutations within a quad, which is what makes them
+// affordable: DPP applies them as a modifier on a move, in the vector unit.
+// This was ds_bpermute first, and measured no faster than the software path it
+// replaced -- twelve round trips to local memory per instruction cost about
+// what the thirty-two multiply-adds had.
+__device__ static inline uint32_t fp8_quad_low(uint32_t value)
+{
+    // quad_perm[0,0,1,1]: lane t takes what lane t/2 holds.
+    return std::bit_cast<uint32_t>(
+        __builtin_amdgcn_mov_dpp(std::bit_cast<int32_t>(value), 0x50, 0xF, 0xF, true));
+}
+
+__device__ static inline uint32_t fp8_quad_high(uint32_t value)
+{
+    // quad_perm[2,2,3,3]: the same, two lanes further on.
+    return std::bit_cast<uint32_t>(
+        __builtin_amdgcn_mov_dpp(std::bit_cast<int32_t>(value), 0xFA, 0xF, 0xF, true));
+}
+
+// Two of the four bytes gathered from one lane, widened and packed as the pair
+// of halves the hardware instruction expects.
+//
+// Widening is what this path spends its time on, not multiplying, so it is
+// worth doing without a branch and two at a time. Both formats are sign,
+// exponent, mantissa in that order, and shifting the seven low bits into
+// position lands each value on an f16 whose exponent is biased by fifteen where
+// e4m3 biases by seven -- which is to say, on the true value divided by 2^8. An
+// e4m3 denormal lands on an f16 denormal by that same factor, so one multiply
+// corrects both cases, and it is a packed multiply: both halves at once.
+//
+// Only NaN falls outside. e4m3 has no infinity, so its single all-ones pattern
+// would otherwise come out as an ordinary 480.
+//
+// This replaces a call through HIP's conversion, which went by way of float and
+// back for every one of the twenty-four values an instruction needs.
+//
+// The numerical battery only feeds this small whole numbers, so it would not
+// notice a wrong denormal or a mishandled NaN. tools/e4m3_bits_check.cpp checks
+// every one of the 65536 ordered pairs against the definition of the format,
+// which also proves the two halves cannot leak into one another.
+__device__ static inline uint32_t fp8_widen_pair(uint32_t packed, int pair)
+{
+    const uint32_t two = pair == 0 ? packed : (packed >> 16);
+    // The two bytes, one to each half of the register.
+    const uint32_t x = (two & 0xFFu) | ((two & 0xFF00u) << 8);
+    const uint32_t sign = (x & 0x00800080u) << 8;
+    const uint32_t magnitude = (x & 0x007F007Fu) << 7;
+    // Adding one carries into bit 7 only out of 0x7F, e4m3's only NaN.
+    const uint32_t is_nan = ((x & 0x007F007Fu) + 0x00010001u) & 0x00800080u;
+    const uint32_t nan_mask = (is_nan >> 7) * 0xFFFFu;
+
+    const f16x2 scaled = std::bit_cast<f16x2>(magnitude) * f16(256.0f);
+    return sign | (std::bit_cast<uint32_t>(scaled) & ~nan_mask) | (nan_mask & 0x7E007E00u);
+}
+
+// One half of the reduction: sixteen of the thirty-two k values.
+__device__ static inline float4::Native_vec_ fp8_mma_half(uint32_t a_row0, uint32_t a_row8,
+                                                          uint32_t b, float4::Native_vec_ acc)
+{
+    // Which of the two byte pairs this lane wants out of whatever it is handed.
+    const int pair = int(FUNC_CALL(sreg_laneid)()) & 1;
+
+    uint4::Native_vec_ a;
+    a[0] = fp8_widen_pair(fp8_quad_low(a_row0), pair);
+    a[1] = fp8_widen_pair(fp8_quad_low(a_row8), pair);
+    a[2] = fp8_widen_pair(fp8_quad_high(a_row0), pair);
+    a[3] = fp8_widen_pair(fp8_quad_high(a_row8), pair);
+
+    uint2::Native_vec_ bb;
+    bb[0] = fp8_widen_pair(fp8_quad_low(b), pair);
+    bb[1] = fp8_widen_pair(fp8_quad_high(b), pair);
+
+    return __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a, bb, acc);
+}
+
+    uint2::Native_vec_ FUNC(mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint2::Native_vec_ c_reg)
+    {
+        f16x2 c01 = std::bit_cast<f16x2>(c_reg[0]);
+        f16x2 c23 = std::bit_cast<f16x2>(c_reg[1]);
+        float4::Native_vec_ d;
+        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 12000)
+        {
+            d = float4::Native_vec_{float(c01.x), float(c01.y), float(c23.x), float(c23.y)};
+            d = fp8_mma_half(a_reg[0], a_reg[1], b_reg[0], d); // k 0..15
+            d = fp8_mma_half(a_reg[2], a_reg[3], b_reg[1], d); // k 16..31
+        }
+        else
+        {
+            d = fallback_mma_sync_aligned<float, e4m3x4>(
+                a_reg, b_reg,
+                HIP_vector_base<float, 4>(float(c01.x), float(c01.y), float(c23.x), float(c23.y)));
+        }
+        f16x2 d01 = {f16(d.x), f16(d.y)};
+        f16x2 d23 = {f16(d.z), f16(d.w)};
+        return {std::bit_cast<uint32_t>(d01), std::bit_cast<uint32_t>(d23)};
     }
 }
 
@@ -1207,10 +1562,141 @@ extern "C"
         return FUNC_CALL(texobj_2d_v4_##RETURN_TYPE##_##COORD_TYPE)(uint64_t(texref->textureObject), coord);                                                                            \
     }
 
+    static v4f32 sample_2D_lod(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v2f32 coord, float lod) __device__
+    {
+        __device__ v4f32 __llvm_amdgcn_image_sample_l_2d_v4f32_f32(uint32_t, float, float, float, v8s32, v4s32, bool, int, int) __asm("llvm.amdgcn.image.sample.l.2d.v4f32.f32");
+        GLOBAL_SPACE v8s32 *image_typed = (GLOBAL_SPACE v8s32 *)image;
+        GLOBAL_SPACE v4s32 *sampler_typed = (GLOBAL_SPACE v4s32 *)sampler;
+        return __llvm_amdgcn_image_sample_l_2d_v4f32_f32(0xf, coord.x, coord.y, lod, *image_typed, *sampler_typed, false, 0, 0);
+    }
+// tex.level samples at the LOD the instruction carries, so it lowers to
+// image.sample.l rather than the image.sample.lz the other forms use.
+#define tex_2d_level(RETURN_TYPE, COORD_TYPE)                                                                                                                                           \
+    v4##RETURN_TYPE FUNC(texobj_2d_v4_##RETURN_TYPE##_##COORD_TYPE##_level)(uint64_t texobj, v2##COORD_TYPE coord, float lod)                                                           \
+    {                                                                                                                                                                                   \
+        auto [i, s] = get_image_and_sampler(texobj);                                                                                                                                    \
+        auto result = sample_2D_lod(i, s, v2f32{float(coord.x), float(coord.y)}, lod);                                                                                                  \
+        return v4##RETURN_TYPE{std::bit_cast<RETURN_TYPE>(result.x), std::bit_cast<RETURN_TYPE>(result.y), std::bit_cast<RETURN_TYPE>(result.z), std::bit_cast<RETURN_TYPE>(result.w)}; \
+    }                                                                                                                                                                                   \
+    v4##RETURN_TYPE FUNC(texref_2d_v4_##RETURN_TYPE##_##COORD_TYPE##_level)(struct textureReference GLOBAL_SPACE * texref, v2##COORD_TYPE coord, float lod)                             \
+    {                                                                                                                                                                                   \
+        return FUNC_CALL(texobj_2d_v4_##RETURN_TYPE##_##COORD_TYPE##_level)(uint64_t(texref->textureObject), coord, lod);                                                               \
+    }
+
     tex_2d(f32, f32);
     tex_2d(s32, s32);
+    tex_2d_level(f32, f32);
+
+    static void store_2D(uint64_t surfobj, v2s32 coord, v4f32 data) __device__
+    {
+        // This goes through the same device library entry point HIP's surf2Dwrite
+        // uses instead of naming llvm.amdgcn.image.store.2d by hand. Spelling the
+        // intrinsic out let the optimizer narrow the call to its single-channel
+        // overload, extracting element 0 and dropping the other three without a
+        // word - exactly the kind of silent data loss worth avoiding.
+        // A surface object is the image descriptor itself, with no sampler after it.
+        __device__ void __ockl_image_store_2D(const unsigned int CONSTANT_SPACE *, v2s32, v4f32);
+        __ockl_image_store_2D((const unsigned int CONSTANT_SPACE *)surfobj, coord, data);
+    }
+
+    void FUNC(sustobj_p_2d_v4_b32)(uint64_t surfobj, v2s32 coord, v4s32 data)
+    {
+        store_2D(surfobj, coord, std::bit_cast<v4f32>(data));
+    }
+
+    // sust.b writes raw bits and takes the x coordinate in bytes, so it has to be
+    // scaled down to a sample index first. This mirrors what HIP's surf2Dwrite does:
+    // divide by the bytes per channel, then by the channels per pixel, both read
+    // from the image descriptor at runtime.
+    static int32_t byte_x_to_sample_x(uint64_t surfobj, int32_t x) __device__
+    {
+        __device__ int __ockl_image_channel_data_type_2D(const unsigned int CONSTANT_SPACE *);
+        __device__ int __ockl_image_channel_order_2D(const unsigned int CONSTANT_SPACE *);
+        // Indexed by hsa_ext_image_channel_type_t; 3 means "divide by 3".
+        static const int channel_bytes_shift[] = {0, 1, 0, 1, 3, 1, 1, 1, 0, 1, 2, 0, 1, 2, 1, 2};
+        // Indexed by hsa_ext_image_channel_order_t.
+        static const int channel_count_shift[] = {0, 0, 1, 1, 3, 1, 3, 2, 2, 2, 2, 2, 3, 2, 2, 2, 0, 0, 0, 0};
+        const unsigned int CONSTANT_SPACE *image = (const unsigned int CONSTANT_SPACE *)surfobj;
+        int by_type = channel_bytes_shift[__ockl_image_channel_data_type_2D(image)];
+        x = by_type == 3 ? x / 3 : x >> by_type;
+        int by_order = channel_count_shift[__ockl_image_channel_order_2D(image)];
+        return by_order == 3 ? x / 3 : x >> by_order;
+    }
+
+    // Raw values ride in the four 32 bit lanes of the store, each element widened
+    // and reinterpreted rather than converted - again as HIP does it.
+    static v4f32 raw_lanes(uint32_t a, uint32_t b, uint32_t c, uint32_t d) __device__
+    {
+        return v4f32{std::bit_cast<float>(a), std::bit_cast<float>(b),
+                     std::bit_cast<float>(c), std::bit_cast<float>(d)};
+    }
+
+    void FUNC(sustobj_b_2d_b32)(uint64_t surfobj, v2s32 coord, uint32_t data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data, 0, 0, 0));
+    }
+
+    void FUNC(sustobj_b_2d_v2_b16)(uint64_t surfobj, v2s32 coord, v2u16 data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data.x, data.y, 0, 0));
+    }
+
+    void FUNC(sustobj_b_2d_v4_b8)(uint64_t surfobj, v2s32 coord, v4u8 data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data.x, data.y, data.z, data.w));
+    }
+
+    void FUNC(sustobj_p_2d_b32)(uint64_t surfobj, v2s32 coord, s32 data)
+    {
+        // A single channel surface still goes through the four channel store; the
+        // descriptor decides how many of them actually land.
+        v4f32 splat = {std::bit_cast<float>(data), 0.0f, 0.0f, 0.0f};
+        store_2D(surfobj, coord, splat);
+    }
     tex_2d(f32, s32);
     tex_2d(s32, f32);
+
+// An .f16 destination gets the sampled values converted to half rather than
+// reinterpreted, so it cannot go through tex_2d above, which bit_casts.
+#define tex_2d_f16(COORD_TYPE)                                                                                                                                                          \
+    f16x4 FUNC(texobj_2d_v4_f16_##COORD_TYPE)(uint64_t texobj, v2##COORD_TYPE coord)                                                                                                    \
+    {                                                                                                                                                                                   \
+        auto [i, s] = get_image_and_sampler(texobj);                                                                                                                                    \
+        auto result = sample_2D(i, s, v2f32{float(coord.x), float(coord.y)});                                                                                                           \
+        return f16x4{f16(result.x), f16(result.y), f16(result.z), f16(result.w)};                                                                                                       \
+    }                                                                                                                                                                                   \
+    f16x4 FUNC(texref_2d_v4_f16_##COORD_TYPE)(struct textureReference GLOBAL_SPACE * texref, v2##COORD_TYPE coord)                                                                      \
+    {                                                                                                                                                                                   \
+        return FUNC_CALL(texobj_2d_v4_f16_##COORD_TYPE)(uint64_t(texref->textureObject), coord);                                                                                        \
+    }
+
+    tex_2d_f16(s32);
+    tex_2d_f16(f32);
+
+// tld4 gathers one component from the four texels of the 2x2 footprint. These go
+// through the device library entry points rather than naming the gather4 intrinsic
+// directly, for the same reason as the surface store: a hand written intrinsic name
+// is remangled from the argument types and can silently pick a different overload.
+#define tex_2d_gather(COMP)                                                                                                                                                             \
+    v4f32 FUNC(texobj_2d_v4_f32_f32_gather_##COMP)(uint64_t texobj, v2f32 coord)                                                                                                        \
+    {                                                                                                                                                                                   \
+        __device__ v4f32 __ockl_image_gather4##COMP##_2D(const unsigned int CONSTANT_SPACE *, const unsigned int CONSTANT_SPACE *, v2f32);                                              \
+        const unsigned int CONSTANT_SPACE *image = (const unsigned int CONSTANT_SPACE *)texobj;                                                                                         \
+        const unsigned int CONSTANT_SPACE *sampler = image + HIP_SAMPLER_OBJECT_OFFSET_DWORD;                                                                                           \
+        return __ockl_image_gather4##COMP##_2D(image, sampler, coord);                                                                                                                  \
+    }                                                                                                                                                                                   \
+    v4f32 FUNC(texref_2d_v4_f32_f32_gather_##COMP)(struct textureReference GLOBAL_SPACE * texref, v2f32 coord)                                                                          \
+    {                                                                                                                                                                                   \
+        return FUNC_CALL(texobj_2d_v4_f32_f32_gather_##COMP)(uint64_t(texref->textureObject), coord);                                                                                   \
+    }
+
+    tex_2d_gather(r);
+    tex_2d_gather(g);
+    tex_2d_gather(b);
+    tex_2d_gather(a);
 
     static v4f32 sample_3D(GLOBAL_SPACE void *image, GLOBAL_SPACE void *sampler, v4f32 coord) __device__
     {

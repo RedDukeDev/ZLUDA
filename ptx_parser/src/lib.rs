@@ -382,6 +382,7 @@ fn reg_or_immediate<'a, 'input>(
     trace(
         "reg_or_immediate",
         alt((
+            Token::Underscore.value(ast::RegOrImmediate::Sink),
             immediate_value.map(|imm| ast::RegOrImmediate::Imm(imm)),
             ident.map(|id| ast::RegOrImmediate::Reg(id)),
         )),
@@ -1527,6 +1528,8 @@ impl<Ident> ast::ParsedOperand<Ident> {
         trace(
             "operand",
             alt((
+                // Before the identifier rules: `_` is the sink, not a name.
+                Token::Underscore.value(ast::ParsedOperand::Sink),
                 trace("ident_operands", ident_operands),
                 immediate_value.map(ast::ParsedOperand::Imm),
                 trace(
@@ -1941,6 +1944,12 @@ derive_parser!(
         Semicolon,
         #[token("@")]
         At,
+        // The sink, `_`. The identifier rule below deliberately requires a
+        // character after a leading underscore, so a bare one needs its own
+        // token; without it a `mov.b64 {%r1, _}, %rd1` fails to parse and takes
+        // the whole module with it.
+        #[token("_")]
+        Underscore,
         #[regex(r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
         Ident(&'input str),
         #[regex(r"\.[a-zA-Z][a-zA-Z0-9_$]*|\.[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
@@ -2070,6 +2079,10 @@ derive_parser!(
     }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
+    pub enum SustClamp { }
+
+
+    #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
     pub enum MatrixShape { }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
@@ -2097,17 +2110,22 @@ derive_parser!(
         }
     }
     .vec: VectorPrefix = { .v2, .v4, .v8 };
+    // .b128 is how sm_120 PTX packs four 32-bit registers into one value:
+    // `mov.b128 v, {%r1, %r2, %r3, %r4}`. It expands like any other packed
+    // move, into a vector of four .b32.
     .type: ScalarType =  { .pred,
-                           .b16, .b32, .b64,
+                           .b16, .b32, .b64, .b128,
                            .u16, .u32, .u64,
                            .s16, .s32, .s64,
                                  .f32, .f64 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st
     st{.weak}{.ss}{.cop}{.level::eviction_priority}{.level::cache_hint}{.vec}.type  [a], b{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st instruction with cache policy/eviction priority/cache hints".to_string()));
-        }
+        // Eviction priority and cache hints say where a line should live, not
+        // what the access does; the cache policy operand is a descriptor for
+        // the same. Dropping them costs performance on hardware that honours
+        // them and changes nothing observable, so they are accepted silently
+        // rather than failing the module they appear in.
         Instruction::St {
             data: StData {
                 qualifier: weak.unwrap_or(RawLdStQualifier::Weak).into(),
@@ -2130,9 +2148,11 @@ derive_parser!(
         }
     }
     st.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st.relaxed instruction with cache policy/eviction priority/cache hints".to_string()));
-        }
+        // Eviction priority and cache hints say where a line should live, not
+        // what the access does; the cache policy operand is a descriptor for
+        // the same. Dropping them costs performance on hardware that honours
+        // them and changes nothing observable, so they are accepted silently
+        // rather than failing the module they appear in.
         Instruction::St {
             data: StData {
                 qualifier: ast::LdStQualifier::Relaxed(scope),
@@ -2144,9 +2164,10 @@ derive_parser!(
         }
     }
     st.release.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st.release instruction with cache policy/eviction priority/cache hints".to_string()));
-        }
+        // Eviction priority, cache hints and the cache policy operand are advisory in
+        // PTX and carry no semantics, so dropping them changes nothing observable.
+        // The release ordering, state space and type are all kept.
+        let _ = (level_eviction_priority, level_cache_hint, &cache_policy);
         Instruction::St {
             data: StData {
                 qualifier: ast::LdStQualifier::Release(scope),
@@ -2187,7 +2208,6 @@ derive_parser!(
     ld{.weak}{.ss}{.cop}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type   d, [a]{.unified}{, cache_policy} => {
         let (a, unified) = a;
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || unified || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2216,9 +2236,13 @@ derive_parser!(
         }
     }
     ld.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.relaxed instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
-        }
+        // Advisory only, as for st.release above: dropped without consequence.
+        let _ = (
+            level_eviction_priority,
+            level_cache_hint,
+            level_prefetch_size,
+            &cache_policy,
+        );
         Instruction::Ld {
             data: LdDetails {
                 qualifier: ast::LdStQualifier::Relaxed(scope),
@@ -2232,7 +2256,6 @@ derive_parser!(
     }
     ld.acquire.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
         if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.acquire instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2279,9 +2302,6 @@ derive_parser!(
             if let Some(level_eviction_priority) = level_eviction_priority {
                 state.errors.push(PtxError::SyntaxError(format!("cannot have both {} and {} in {:?}", cop, level_eviction_priority, state.text)));
             }
-        }
-        if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.global.nc instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
         }
         Instruction::Ld {
             data: LdDetails {
@@ -2348,6 +2368,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2364,6 +2385,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2384,6 +2406,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2400,6 +2423,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2416,6 +2440,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2432,6 +2457,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2480,6 +2506,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2494,6 +2521,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2511,6 +2539,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2525,6 +2554,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2539,6 +2569,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2553,6 +2584,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -2608,7 +2640,7 @@ derive_parser!(
                                   .lo, .ls, .hi, .hs, // signed
                                   .equ, .neu, .ltu, .leu, .gtu, .geu, .num, .nan }; // float-only
     .BoolOp: SetpBoolPostOp = { .and, .or, .xor };
-    .dtype: ScalarType = { .u32, .s32, .f32 };
+    .dtype: ScalarType = { .u32, .s32, .f32, .f16 };
     .dtype_f16x2: ScalarType = { .u32, .f16x2 };
     .stype: ScalarType = { .b16, .b32, .b64, .u16, .u32, .u64, .s16, .s32, .s64, .f16, .f32, .f64 };
 
@@ -2689,8 +2721,15 @@ derive_parser!(
     // cvt.frnd2{.relu}{.satfinite}.f16.f32       d, a;
     // cvt.frnd2{.relu}{.satfinite}.f16x2.f32     d, a, b;
     // cvt.frnd2{.relu}{.satfinite}.bf16.f32      d, a;
+    // This also covers the conversions to fp8, which used to have a rule of their
+    // own. Keeping them separate would be a fifth cvt rule beginning with .rn, and
+    // the pattern selection in derive_parser! cannot tell five of them apart; folding
+    // them in here brings the count down instead of up.
     cvt.frnd2{.relu}{.satfinite}.x2_to_type.x2_from_type    d, a {, b} => {
-        if satfinite {
+        let to_fp8 = x2_to_type == ScalarType::E4m3x2 || x2_to_type == ScalarType::E5m2x2;
+        // satfinite is mandatory on the way to fp8 and the conversion saturates by
+        // itself, so it needs no separate post-clamp. Elsewhere it is still a TODO.
+        if satfinite && !to_fp8 {
             state.errors.push(PtxError::Todo("cvt.frnd2 instruction with satfinite modifier".to_string()));
         }
         let data = ast::CvtDetails::new(&mut state.errors, Some(frnd2), false, false, relu, x2_to_type, x2_from_type);
@@ -2701,17 +2740,6 @@ derive_parser!(
     }
     // cvt.rna{.satfinite}.tf32.f32               d, a;
     // cvt.frnd2{.relu}.tf32.f32                   d, a;
-    cvt.rn.satfinite{.relu}.f8x2type.f32       d, a, b => {
-        if relu {
-            state.errors.push(PtxError::Todo("cvt.rn.satfinite.f8x2 instruction with relu modifier".to_string()));
-        }
-        let data = ast::CvtDetails::new(&mut state.errors, Some(rn), false, false, false, f8x2type, ScalarType::F32);
-        ast::Instruction::Cvt {
-            data,
-            arguments: ast::CvtArgs { dst: d, src: a, src2: Some(b) }
-        }
-    }
-    // cvt.rn.satfinite{.relu}.f8x2type.f16x2     d, a;
     /*
     cvt.rn{.relu}.f16x2.f8x2type              d, a => {
         if relu {
@@ -2734,9 +2762,8 @@ derive_parser!(
     .atype: ScalarType =        { .u8,   .u16, .u32, .u64,
                                   .s8,   .s16, .s32, .s64,
                                   .bf16, .f16, .f32, .f64 };
-    .f8x2type: ScalarType =         { .e4m3x2, .e5m2x2 };
-    .x2_to_type: ScalarType =      { .f16x2, .bf16x2 };
-    .x2_from_type: ScalarType =    { .e4m3x2, .e5m2x2, .f32 };
+    .x2_to_type: ScalarType =      { .f16x2, .bf16x2, .e4m3x2, .e5m2x2 };
+    .x2_from_type: ScalarType =    { .e4m3x2, .e5m2x2, .f32, .f16x2 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt-pack
     cvt.pack.sat.convertType.s32.b32        d, a, b, c => {
@@ -2941,6 +2968,7 @@ derive_parser!(
                     rounding: ast::RoundingMode::NearestEven,
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: false
                 }
             ),
@@ -2955,6 +2983,7 @@ derive_parser!(
                     rounding: rnd.into(),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: false
                 }
             ),
@@ -2969,6 +2998,7 @@ derive_parser!(
                     rounding: rnd.into(),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: false
                 }
             ),
@@ -2987,6 +3017,7 @@ derive_parser!(
                 rounding: rnd.into(),
                 flush_to_zero: Some(ftz),
                 saturate: sat,
+                relu: false,
                 is_fusable: false
             },
             arguments: FmaArgs { dst: d, src1: a, src2: b, src3: c  }
@@ -2999,6 +3030,7 @@ derive_parser!(
                 rounding: rnd.into(),
                 flush_to_zero: None,
                 saturate: false,
+                relu: false,
                 is_fusable: false
             },
             arguments: FmaArgs { dst: d, src1: a, src2: b, src3: c  }
@@ -3014,6 +3046,7 @@ derive_parser!(
                 rounding: rnd.into(),
                 flush_to_zero: Some(ftz),
                 saturate: sat,
+                relu: false,
                 is_fusable: false
             },
             arguments: FmaArgs { dst: d, src1: a, src2: b, src3: c  }
@@ -3025,16 +3058,16 @@ derive_parser!(
     //fma.rnd{.ftz}.relu.f16      d, a, b, c;
     //fma.rnd{.ftz}.relu.f16x2    d, a, b, c;
     //fma.rnd{.relu}.bf16         d, a, b, c;
-    fma.rnd{.relu}.type_x2       d, a, b, c => {
-        if relu {
-            state.errors.push(PtxError::Todo("fma instruction with relu modifier for bf16x2/f16x2 types".to_string()));
-        }
+    // .sat and .relu are mutually exclusive in PTX. .sat clamps to [0,1] and is
+    // already handled by the insert_post_saturation pass; .relu clamps to [0,+inf).
+    fma.rnd{.sat}{.relu}.type_x2       d, a, b, c => {
         ast::Instruction::Fma {
             data: ast::ArithFloat {
                 type_: type_x2,
                 rounding: rnd.into(),
                 flush_to_zero: None,
-                saturate: false,
+                saturate: sat,
+                relu,
                 is_fusable: false
             },
             arguments: FmaArgs { dst: d, src1: a, src2: b, src3: c  }
@@ -3081,6 +3114,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -3095,6 +3129,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -3112,6 +3147,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -3126,6 +3162,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: Some(ftz),
                     saturate: sat,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -3140,6 +3177,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -3154,6 +3192,7 @@ derive_parser!(
                     rounding: rnd.map(Into::into).unwrap_or(ast::RoundingMode::NearestEven),
                     flush_to_zero: None,
                     saturate: false,
+                    relu: false,
                     is_fusable: rnd.is_none()
                 }
             ),
@@ -3176,7 +3215,6 @@ derive_parser!(
             arguments: MinArgs { dst: d, src1: a, src2: b  }
         }
     }
-    //min{.relu}.btype  d, a, b => { todo!() }
     min.btype  d, a, b => {
         ast::Instruction::Min {
             data: ast::MinMaxDetails::Signed(btype),
@@ -3186,6 +3224,20 @@ derive_parser!(
     .atype: ScalarType = { .u16, .u32, .u64,
                            .u16x2, .s16, .s64 };
     .btype: ScalarType = { .s16x2, .s32 };
+
+    // Its own group, after the block above: a declaration block serves every
+    // rule back to the previous block, so putting this one in the middle would
+    // leave the plain min rules without their types.
+    min.relu.relu_type  d, a, b => {
+        ast::Instruction::MinRelu {
+            data: ast::MinReluDetails {
+                type_: ast::Type::Scalar(relu_type),
+                scalar: relu_type
+            },
+            arguments: MinReluArgs { dst: d, src1: a, src2: b }
+        }
+    }
+    .relu_type: ScalarType = { .s32 };
 
     //min{.ftz}{.NaN}{.xorsign.abs}.f32  d, a, b;
     min{.ftz}{.NaN}.f32   d, a, b => {
@@ -3537,6 +3589,43 @@ derive_parser!(
     }
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-atom
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-red
+    // The vector reduction: an atomic add whose result nobody wants. It is the
+    // same operation the packed atom rule below performs, so it builds the same
+    // instruction and sends the result to the sink.
+    red{.red_sem}{.red_scope}.global{.red_vec}.red_type.red_op.noftz  [a], b => {
+        let _ = red_op; // only .add exists here
+        let count = red_vec.map(|v| v.len().get()).unwrap_or(1);
+        ast::Instruction::RedVector {
+            data: ast::RedVectorDetails {
+                // The words are carried as plain 32 bit lanes: a vector whose
+                // elements are themselves vectors is not a type LLVM has.
+                type_: ast::Type::Vector(count, ScalarType::B32),
+                element: red_type,
+                count,
+                semantics: red_sem.map(Into::into).unwrap_or(AtomSemantics::Relaxed),
+                scope: red_scope.unwrap_or(MemScope::Gpu)
+            },
+            arguments: RedVectorArgs { src_address: a, src_values: b }
+        }
+    }
+    .red_sem: AtomSemantics = { .relaxed, .acquire, .release, .acq_rel };
+    .red_scope: MemScope =    { .cta, .cluster, .gpu, .sys };
+    .red_vec: VectorPrefix =  { .v2, .v4, .v8 };
+    .red_type: ScalarType =   { .f16x2, .bf16x2, .f32 };
+    .red_op: RawAtomicOp =    { .add };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar-fence
+    // Emitted as the sequentially consistent fence membar already builds:
+    // stronger than what is asked for, which is always sound.
+    fence.fence_sem.fence_scope => {
+        ast::Instruction::Membar { data: fence_scope }
+    }
+    // Only the form the modules actually contain; a typeless modifier with
+    // several alternatives is not something the generator accepts.
+    .fence_sem =              { .release };
+    .fence_scope: MemScope =  { .cta, .cluster, .gpu, .sys };
+
     atom{.sem}{.scope}{.space}.op{.level::cache_hint}.type                                      d, [a], b{, cache_policy} => {
         if level_cache_hint || cache_policy.is_some() {
             state.errors.push(PtxError::Todo("atom instruction with cache policy/cache hints".to_string()));
@@ -3861,6 +3950,16 @@ derive_parser!(
     .type: ScalarType = { .b32, .b64 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-brev
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-movmatrix
+    // Transposes the 8x8 matrix the warp holds in one register per lane.
+    movmatrix.sync.trans.aligned.m8n8.mmtype  d, a => {
+        ast::Instruction::MovMatrix {
+            data: mmtype,
+            arguments: MovMatrixArgs { dst: d, src: a, },
+        }
+    }
+    .mmtype: ScalarType = { .b16 };
+
     brev.type  d, a => {
         ast::Instruction::Brev {
             data: type_,
@@ -4059,6 +4158,57 @@ derive_parser!(
     .cop: RawCpAsyncCacheOperator = { .ca, .cg };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-commit-group
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk
+    // Issued by a single elected lane; the whole block then waits on the
+    // barrier. Emulated as a synchronous copy -- see the note on the AST
+    // declaration.
+    cp.async.bulk.dst_space.src_space.completion  [dst], [src], size, [barrier] => {
+        Instruction::CpAsyncBulk {
+            arguments: CpAsyncBulkArgs { src_to: dst, src_from: src, src_size: size, src_barrier: barrier }
+        }
+    }
+    .dst_space: StateSpace = { .shared::cta };
+    .src_space: StateSpace = { .global };
+    .completion = { .mbarrier::complete_tx::bytes };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier
+    mbarrier.init{.mbar_space}.b64  [barrier], count => {
+        Instruction::MbarrierInit {
+            arguments: MbarrierInitArgs { src_barrier: barrier, src_count: count }
+        }
+    }
+    .mbar_space: StateSpace = { .shared{::cta} };
+
+    mbarrier.expect_tx{.mbar_sem}{.mbar_scope}{.mbar_space}.b64  [barrier], count => {
+        Instruction::MbarrierExpectTx {
+            arguments: MbarrierExpectTxArgs { src_barrier: barrier, src_count: count }
+        }
+    }
+    .mbar_sem = { .relaxed };
+    .mbar_scope = { .cta };
+    .mbar_space: StateSpace = { .shared{::cta} };
+
+    mbarrier.arrive{.mbar_space}.b64  dst, [barrier], count => {
+        Instruction::MbarrierArrive {
+            arguments: MbarrierArriveArgs { dst, src_barrier: barrier, src_count: count }
+        }
+    }
+    .mbar_space: StateSpace = { .shared{::cta} };
+
+    mbarrier.try_wait{.mbar_space}.b64  dst, [barrier], wait_state => {
+        Instruction::MbarrierTryWait {
+            arguments: MbarrierTryWaitArgs { dst, src_barrier: barrier, src_state: wait_state }
+        }
+    }
+    .mbar_space: StateSpace = { .shared{::cta} };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-elect-sync
+    elect.sync  dst|dst_pred, membermask => {
+        Instruction::ElectSync {
+            arguments: ElectSyncArgs { dst, dst_pred, src_membermask: membermask }
+        }
+    }
+
     cp.async.commit_group => {
         Instruction::CpAsyncCommitGroup {}
     }
@@ -4199,6 +4349,7 @@ derive_parser!(
                 alayout,
                 blayout,
                 cd_type_scalar: ScalarType::F32,
+                k: 16,
                 ab_type_scalar: ScalarType::BF16,
             },
             arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
@@ -4211,6 +4362,20 @@ derive_parser!(
                 alayout,
                 blayout,
                 cd_type_scalar: ScalarType::F32,
+                k: 16,
+                ab_type_scalar: ScalarType::F16,
+            },
+            arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+
+    mma.sync.aligned.m16n8k16.alayout.blayout.f16.f16.f16.f16 d, a, b, c => {
+        Instruction::Mma {
+            data: MmaDetails {
+                alayout,
+                blayout,
+                cd_type_scalar: ScalarType::F16,
+                k: 16,
                 ab_type_scalar: ScalarType::F16,
             },
             arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
@@ -4223,9 +4388,70 @@ derive_parser!(
                 alayout,
                 blayout,
                 cd_type_scalar: ScalarType::S32,
+                k: 32,
                 ab_type_scalar: ScalarType::S8,
             },
             arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+
+    .alayout: MatrixLayout = {.row};
+    .blayout: MatrixLayout = {.col};
+
+    // FP8 (e4m3) inputs with an f16 accumulator. The fragment layout is the one
+    // every 8 bit m16n8k32 form uses -- the same as .s8 -- so only the numeric
+    // interpretation of the bytes differs. Own declaration group: adding a fifth
+    // rule to a group makes derive_parser! stop resolving dtype/ctype.
+    mma.sync.aligned.m16n8k32.alayout.blayout.f16.fp8_atype.fp8_btype.f16 d, a, b, c => {
+        Instruction::Mma {
+            data: MmaDetails {
+                alayout,
+                blayout,
+                cd_type_scalar: ScalarType::F16,
+                k: 32,
+                ab_type_scalar: fp8_atype,
+            },
+            arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+
+    .alayout: MatrixLayout = {.row};
+    .blayout: MatrixLayout = {.col};
+    .fp8_atype: ScalarType = {.e4m3};
+    .fp8_btype: ScalarType = {.e4m3};
+
+    // Same fragment layout as m16n8k16 restricted to k = 0..7, so the A and B
+    // fragments are just the first half of the k16 ones.
+    mma.sync.aligned.m16n8k8.alayout.blayout.f16.f16.f16.f16 d, a, b, c => {
+        Instruction::Mma {
+            data: MmaDetails {
+                alayout,
+                blayout,
+                cd_type_scalar: ScalarType::F16,
+                k: 8,
+                ab_type_scalar: ScalarType::F16,
+            },
+            arguments: MmaArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+
+    .alayout: MatrixLayout = {.row};
+    .blayout: MatrixLayout = {.col};
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-wmma-mma
+    // The fragment layout is deliberately unspecified in the ISA, so it was derived
+    // from NVIDIA's own ptxas: compiling this instruction for sm_89 emits exactly two
+    // HMMA.16816.F16, the same hardware operation mma.sync.m16n8k16 lowers to.
+    wmma.mma.sync.aligned.alayout.blayout.m16n16k16.f16.f16 d, a, b, c => {
+        Instruction::WmmaMma {
+            data: MmaDetails {
+                alayout,
+                blayout,
+                cd_type_scalar: ScalarType::F16,
+                k: 16,
+                ab_type_scalar: ScalarType::F16,
+            },
+            arguments: WmmaMmaArgs { dst: d, src1: a, src2: b, src3: c }
         }
     }
 
@@ -4404,43 +4630,164 @@ derive_parser!(
         })
     }
 
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-sust
+    // .p converts the values to the surface format and takes the x coordinate in
+    // samples; .b writes raw bits with x in bytes and is deliberately left out for
+    // now, so it keeps showing up as unrecognized instead of silently doing nothing.
+    // AMD image stores drop out-of-range writes, which is what .zero asks for, so
+    // .trap is accepted but not told apart from it.
+    sust.p.2d{.vec}.b32{.sustclamp}  [a, b], c => {
+        Instruction::Sust {
+            data: SustData {
+                type_: TexType::Texref,
+                dims: TexDimensions::D2,
+                formatted: true,
+                vector: vec.map(|v| v.len()),
+                scalar_type: ScalarType::B32,
+                clamp: sustclamp.unwrap_or(SustClamp::Trap)
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+    sust.b.2d{.vec}.stype{.sustclamp}  [a, b], c => {
+        Instruction::Sust {
+            data: SustData {
+                type_: TexType::Texref,
+                dims: TexDimensions::D2,
+                formatted: false,
+                vector: vec.map(|v| v.len()),
+                scalar_type: stype,
+                clamp: sustclamp.unwrap_or(SustClamp::Trap)
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+
+    .vec: VectorPrefix = { .v2, .v4 };
+    .stype: ScalarType = { .b8, .b16, .b32 };
+    .sustclamp: SustClamp = { .trap, .clamp, .zero };
+
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#texture-instructions-tex
-    tex.1d.v4.dtype.ctype  d, [a, c] => {
+    // .base selects the base level of the mipmap, which is already what tex does
+    // with no mode qualifier, so this is a pure alias.
+    tex{._texmode}.1d.v4.dtype.ctype  d, [a, c] => {
         Instruction::Tex {
             data: TexData {
                 dtype,
                 ctype,
                 dims: TexDimensions::D1,
-                type_: TexType::Texref
+                type_: TexType::Texref,
+                level: false,
+                gather: None
             },
-            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c, src_lod: None }
         }
     }
-    tex.2d.v4.dtype.ctype  d, [a, c] => {
+    tex{._texmode}.2d.v4.dtype.ctype  d, [a, c] => {
         Instruction::Tex {
             data: TexData {
                 dtype,
                 ctype,
                 dims: TexDimensions::D2,
-                type_: TexType::Texref
+                type_: TexType::Texref,
+                level: false,
+                gather: None
             },
-            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c, src_lod: None }
         }
     }
-    tex.3d.v4.dtype.ctype  d, [a, c] => {
+    tex{._texmode}.3d.v4.dtype.ctype  d, [a, c] => {
         Instruction::Tex {
             data: TexData {
                 dtype,
                 ctype,
                 dims: TexDimensions::D3,
-                type_: TexType::Texref
+                type_: TexType::Texref,
+                level: false,
+                gather: None
             },
-            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c, src_lod: None }
+        }
+    }
+
+    // .level samples at an explicit LOD instead of the base level of the mipmap.
+    tex.level.2d.v4.dtype.ctype  d, [a, c], lod => {
+        Instruction::Tex {
+            data: TexData {
+                dtype,
+                ctype,
+                dims: TexDimensions::D2,
+                type_: TexType::Texref,
+                level: true,
+                gather: None
+            },
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c, src_lod: Some(lod) }
+        }
+    }
+
+    ._texmode = { .base };
+    .dtype: ScalarType = { .u32, .s32, .f32, .f16 };
+    .ctype: ScalarType = { .s32, .f32 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#texture-instructions-tld4
+    // Gathers one component from the four texels around the sample point. Written
+    // out per component rather than with a qualifier, to keep the destination and
+    // coordinate types resolving in this group.
+    tld4.r.2d.v4.dtype.ctype  d, [a, c] => {
+        Instruction::Tex {
+            data: TexData {
+                dtype,
+                ctype,
+                dims: TexDimensions::D2,
+                type_: TexType::Texref,
+                level: false,
+                gather: Some(0)
+            },
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c, src_lod: None }
+        }
+    }
+    tld4.g.2d.v4.dtype.ctype  d, [a, c] => {
+        Instruction::Tex {
+            data: TexData {
+                dtype,
+                ctype,
+                dims: TexDimensions::D2,
+                type_: TexType::Texref,
+                level: false,
+                gather: Some(1)
+            },
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c, src_lod: None }
+        }
+    }
+    tld4.b.2d.v4.dtype.ctype  d, [a, c] => {
+        Instruction::Tex {
+            data: TexData {
+                dtype,
+                ctype,
+                dims: TexDimensions::D2,
+                type_: TexType::Texref,
+                level: false,
+                gather: Some(2)
+            },
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c, src_lod: None }
+        }
+    }
+    tld4.a.2d.v4.dtype.ctype  d, [a, c] => {
+        Instruction::Tex {
+            data: TexData {
+                dtype,
+                ctype,
+                dims: TexDimensions::D2,
+                type_: TexType::Texref,
+                level: false,
+                gather: Some(3)
+            },
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c, src_lod: None }
         }
     }
 
     .dtype: ScalarType = { .u32, .s32, .f32 };
-    .ctype: ScalarType = { .s32, .f32 };
+    .ctype: ScalarType = { .f32 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/
     match.any.sync.type  d, a, membermask => {

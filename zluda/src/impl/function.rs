@@ -86,10 +86,44 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
-    // TODO: fix constants in extra
-    if !extra.is_null() {
-        return hipError_t::ErrorNotSupported;
-    }
+    // The `extra` form packs every argument into one buffer and describes it
+    // with a marker list, instead of passing an array of pointers. CUDA and HIP
+    // agree on the markers -- BUFFER_POINTER is 1 and BUFFER_SIZE is 2 in both
+    // -- but not on the terminator: CUDA ends the list with a null pointer,
+    // HIP with 0x03. Forwarding a CUDA list unchanged would leave HIP scanning
+    // past the end, so the list is rebuilt with HIP's terminator.
+    //
+    // This is not a corner: DLSS launches every one of its kernels this way,
+    // and refusing the form made cuLaunchKernel answer NOT_SUPPORTED.
+    let mut translated;
+    let extra = if extra.is_null() {
+        extra
+    } else {
+        // A marker and its value come in pairs. The bound is a guard against a
+        // list that is not terminated at all rather than a real limit; the
+        // defined markers only allow two pairs.
+        const MAX_ENTRIES: usize = 16;
+        translated = Vec::with_capacity(MAX_ENTRIES + 1);
+        unsafe {
+            let mut i = 0;
+            while i < MAX_ENTRIES {
+                let marker = *extra.add(i);
+                if marker.is_null() {
+                    break;
+                }
+                translated.push(marker);
+                translated.push(*extra.add(i + 1));
+                i += 2;
+            }
+            if i >= MAX_ENTRIES {
+                return hipError_t::ErrorInvalidValue;
+            }
+        }
+        // HIP_LAUNCH_PARAM_END. It is a macro in hip_runtime_api.h, so bindgen
+        // does not carry it into hip_runtime-sys and it has to be spelled out.
+        translated.push(0x03 as *mut ::core::ffi::c_void);
+        translated.as_mut_ptr()
+    };
     unsafe {
         hipModuleLaunchKernel(
             f.base,

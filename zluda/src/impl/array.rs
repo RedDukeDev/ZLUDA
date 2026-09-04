@@ -17,3 +17,10 @@ pub(crate) unsafe fn _3d_create_v2(
 ) -> hipError_t {
     hipArray3DCreate(handle, desc)
 }
+
+pub(crate) unsafe fn get_descriptor_v2(
+    p_array_descriptor: *mut HIP_ARRAY_DESCRIPTOR,
+    array: hipArray_t,
+) -> hipError_t {
+    hipArrayGetDescriptor(p_array_descriptor, array)
+}

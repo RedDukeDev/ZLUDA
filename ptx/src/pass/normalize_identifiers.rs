@@ -203,6 +203,9 @@ fn run_array_init<'input, 'b>(
         .map(|elem| match elem {
             ast::RegOrImmediate::Reg(name) => Ok(ast::RegOrImmediate::Reg(resolver.get(name)?)),
             ast::RegOrImmediate::Imm(imm) => Ok(ast::RegOrImmediate::Imm(*imm)),
+            // The sink is a destination. An array initialiser is not one, so
+            // this cannot be reached from valid PTX.
+            ast::RegOrImmediate::Sink => Err(error_unreachable()),
         })
         .collect::<Result<Vec<_>, _>>()?)
 }

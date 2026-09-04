@@ -63,7 +63,9 @@ fn run_instruction<'input>(
         | ast::Instruction::Add {
             data:
                 ast::ArithDetails::Float(ast::ArithFloat {
-                    saturate: false, ..
+                    saturate: false,
+                    relu: false,
+                    ..
                 }),
             ..
         }
@@ -91,6 +93,14 @@ fn run_instruction<'input>(
         | ast::Instruction::Cos { .. }
         | ast::Instruction::Copysign { .. }
         | ast::Instruction::CpAsync { .. }
+        | ast::Instruction::MinRelu { .. }
+        | ast::Instruction::RedVector { .. }
+        | ast::Instruction::CpAsyncBulk { .. }
+        | ast::Instruction::MbarrierInit { .. }
+        | ast::Instruction::MbarrierExpectTx { .. }
+        | ast::Instruction::MbarrierArrive { .. }
+        | ast::Instruction::MbarrierTryWait { .. }
+        | ast::Instruction::ElectSync { .. }
         | ast::Instruction::CpAsyncCommitGroup { .. }
         | ast::Instruction::CpAsyncWaitGroup { .. }
         | ast::Instruction::CpAsyncWaitAll { .. }
@@ -133,7 +143,9 @@ fn run_instruction<'input>(
         | ast::Instruction::Ex2 { .. }
         | ast::Instruction::Fma {
             data: ast::ArithFloat {
-                saturate: false, ..
+                saturate: false,
+                relu: false,
+                ..
             },
             ..
         }
@@ -142,7 +154,9 @@ fn run_instruction<'input>(
         | ast::Instruction::Mad {
             data:
                 ast::MadDetails::Float(ast::ArithFloat {
-                    saturate: false, ..
+                    saturate: false,
+                    relu: false,
+                    ..
                 }),
             ..
         }
@@ -157,7 +171,9 @@ fn run_instruction<'input>(
         | ast::Instruction::Mul {
             data:
                 ast::MulDetails::Float(ast::ArithFloat {
-                    saturate: false, ..
+                    saturate: false,
+                    relu: false,
+                    ..
                 }),
             ..
         }
@@ -192,7 +208,9 @@ fn run_instruction<'input>(
         | ast::Instruction::Sub {
             data:
                 ast::ArithDetails::Float(ast::ArithFloat {
-                    saturate: false, ..
+                    saturate: false,
+                    relu: false,
+                    ..
                 }),
             ..
         }
@@ -212,8 +230,62 @@ fn run_instruction<'input>(
         | ast::Instruction::Sad { .. }
         | ast::Instruction::Dp2a { .. }
         | ast::Instruction::Tex { .. }
+        | ast::Instruction::Sust { .. }
+        | ast::Instruction::MovMatrix { .. }
+        | ast::Instruction::WmmaMma { .. }
         | ast::Instruction::Mma { .. }
         | ast::Instruction::Vshr { .. } => result.push(Statement::Instruction(instruction)),
+        // .relu clamps to [0, +inf) instead of [0, 1]. It is mutually exclusive with
+        // .sat, so this arm sits between the pass-through list and the .sat one.
+        ast::Instruction::Add {
+            data:
+                ast::ArithDetails::Float(ast::ArithFloat {
+                    relu: true,
+                    type_,
+                    ..
+                }),
+            arguments: ast::AddArgs { ref mut dst, .. },
+        }
+        | ast::Instruction::Fma {
+            data:
+                ast::ArithFloat {
+                    relu: true,
+                    type_,
+                    ..
+                },
+            arguments: ast::FmaArgs { ref mut dst, .. },
+        }
+        | ast::Instruction::Mad {
+            data:
+                ast::MadDetails::Float(ast::ArithFloat {
+                    relu: true,
+                    type_,
+                    ..
+                }),
+            arguments: ast::MadArgs { ref mut dst, .. },
+        }
+        | ast::Instruction::Mul {
+            data:
+                ast::MulDetails::Float(ast::ArithFloat {
+                    relu: true,
+                    type_,
+                    ..
+                }),
+            arguments: ast::MulArgs { ref mut dst, .. },
+        }
+        | ast::Instruction::Sub {
+            data:
+                ast::ArithDetails::Float(ast::ArithFloat {
+                    relu: true,
+                    type_,
+                    ..
+                }),
+            arguments: ast::SubArgs { ref mut dst, .. },
+        } => {
+            let clamp = get_post_saturation(resolver, type_, dst, true)?;
+            result.push(Statement::Instruction(instruction));
+            result.push(clamp);
+        }
         ast::Instruction::Add {
             data:
                 ast::ArithDetails::Float(ast::ArithFloat {
@@ -304,7 +376,7 @@ fn run_instruction<'input>(
                 },
             arguments: ast::CvtArgs { ref mut dst, .. },
         } => {
-            let sat = get_post_saturation(resolver, type_, dst)?;
+            let sat = get_post_saturation(resolver, type_, dst, false)?;
             result.push(Statement::Instruction(instruction));
             result.push(sat);
         }
@@ -316,6 +388,7 @@ fn get_post_saturation<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
     type_: ast::ScalarType,
     old_dst: &mut SpirvWord,
+    relu: bool,
 ) -> Result<Statement<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
     let post_sat = resolver.register_unnamed(Some((type_.into(), ast::StateSpace::Reg)));
     let dst = *old_dst;
@@ -324,5 +397,6 @@ fn get_post_saturation<'input>(
         dst,
         src: post_sat,
         type_,
+        relu,
     })
 }

@@ -143,7 +143,7 @@ fn pe_find_fatbin_section(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
         },
     )
     .ok()?;
-    pe_header.sections.iter().find_map(|section| {
+    let dedicated = pe_header.sections.iter().find_map(|section| {
         // PE section name field is limited to 8 chars
         if section.name == *b".nv_fatb" {
             let range = section.pointer_to_raw_data as usize
@@ -154,7 +154,11 @@ fn pe_find_fatbin_section(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
         } else {
             None
         }
-    })
+    });
+    // Not every binary keeps its fatbins in a section of their own. nvngx_dlss.dll
+    // embeds them in .data instead, so fall back to the whole file and let the
+    // scan below pick them out by magic.
+    Some(dedicated.unwrap_or(0..bytes.len()))
 }
 
 fn elf_find_fatbin_section(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
@@ -183,6 +187,31 @@ fn elf_find_fatbin_section(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
     })
 }
 
+// Finds the next plausible fatbin header inside `range`. The magic alone gives
+// false positives in a 48 MB .data section, so a candidate also has to carry the
+// 16 byte header every fatbin uses and a length that stays inside the buffer.
+fn next_fatbin(bytes: &[u8], range: std::ops::Range<usize>) -> Option<usize> {
+    const HEADER_SIZE: u16 = 16;
+    let magic = FatbinHeader::MAGIC;
+    let mut at = range.start;
+    while at + mem::size_of::<FatbinHeader>() <= range.end {
+        if bytes[at..at + 4] == magic {
+            let header = unsafe {
+                bytes[at..].as_ptr().cast::<FatbinHeader>().read_unaligned()
+            };
+            let total = (header.header_size as usize).saturating_add(header.files_size as usize);
+            if header.header_size == HEADER_SIZE
+                && header.files_size > 0
+                && at.saturating_add(total) <= bytes.len()
+            {
+                return Some(at);
+            }
+        }
+        at += 1;
+    }
+    None
+}
+
 fn extract_from_binary(
     scope: &Scope,
     context: ParallelContext,
@@ -202,15 +231,19 @@ fn extract_from_binary(
         if fatbin_range.len() < mem::size_of::<FatbinHeader>() {
             break;
         }
+        // A dedicated .nv_fatbin section packs the fatbins back to back, so this
+        // matches straight away; when they are scattered through .data it walks
+        // over the padding to the next one.
+        let Some(start) = next_fatbin(&compilation.buffer, fatbin_range.clone()) else {
+            break;
+        };
+        fatbin_range.start = start;
         let header = unsafe {
             compilation.buffer[fatbin_range.clone()]
                 .as_ptr()
                 .cast::<FatbinHeader>()
                 .read_unaligned()
         };
-        if header.magic.to_le_bytes() != FatbinHeader::MAGIC {
-            break;
-        }
         {
             let compilation = compilation.clone();
             let fatbin_range = fatbin_range.clone();

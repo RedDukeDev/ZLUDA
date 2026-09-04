@@ -167,6 +167,15 @@ pub(crate) unsafe fn host_alloc(
     Ok(())
 }
 
+// cuMemAllocHost is cuMemHostAlloc with no flags. It has to go through the same
+// bookkeeping, because cuMemFreeHost looks the pointer up in the allocation table.
+pub(crate) unsafe fn alloc_host_v2(
+    pp: &mut *mut ::core::ffi::c_void,
+    bytesize: usize,
+) -> CUresult {
+    host_alloc(pp, bytesize, 0)
+}
+
 pub(crate) unsafe fn host_get_device_pointer_v2(
     pdptr: &mut hipDeviceptr_t,
     p: *mut ::core::ffi::c_void,

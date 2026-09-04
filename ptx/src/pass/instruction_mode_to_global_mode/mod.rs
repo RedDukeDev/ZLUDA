@@ -2159,6 +2159,14 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Shfl { .. }
         | ast::Instruction::MatchSync { .. }
         | ast::Instruction::CpAsync { .. }
+        | ast::Instruction::MinRelu { .. }
+        | ast::Instruction::RedVector { .. }
+        | ast::Instruction::CpAsyncBulk { .. }
+        | ast::Instruction::MbarrierInit { .. }
+        | ast::Instruction::MbarrierExpectTx { .. }
+        | ast::Instruction::MbarrierArrive { .. }
+        | ast::Instruction::MbarrierTryWait { .. }
+        | ast::Instruction::ElectSync { .. }
         | ast::Instruction::CpAsyncCommitGroup { .. }
         | ast::Instruction::CpAsyncWaitGroup { .. }
         | ast::Instruction::CpAsyncWaitAll { .. }
@@ -2185,6 +2193,9 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Dp2a { .. }
         | ast::Instruction::Sad { .. }
         | ast::Instruction::Tex { .. }
+        | ast::Instruction::Sust { .. }
+        | ast::Instruction::MovMatrix { .. }
+        | ast::Instruction::WmmaMma { .. }
         | ast::Instruction::Copysign { .. } => InstructionModes::none(),
         ast::Instruction::Add {
             data: ast::ArithDetails::Integer(_),

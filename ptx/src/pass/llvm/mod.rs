@@ -19,9 +19,10 @@ const PRIVATE_ADDRESS_SPACE: u32 = 5;
 fn get_scalar_type(context: LLVMContextRef, type_: ast::ScalarType) -> LLVMTypeRef {
     match type_ {
         ast::ScalarType::Pred => unsafe { LLVMInt1TypeInContext(context) },
-        ast::ScalarType::S8 | ast::ScalarType::B8 | ast::ScalarType::U8 => unsafe {
-            LLVMInt8TypeInContext(context)
-        },
+        ast::ScalarType::S8
+        | ast::ScalarType::B8
+        | ast::ScalarType::U8
+        | ast::ScalarType::E4m3 => unsafe { LLVMInt8TypeInContext(context) },
         ast::ScalarType::B16
         | ast::ScalarType::U16
         | ast::ScalarType::S16
@@ -60,7 +61,14 @@ fn get_state_space(space: ast::StateSpace) -> Result<u32, TranslateError> {
         ast::StateSpace::Global => Ok(GLOBAL_ADDRESS_SPACE),
         ast::StateSpace::Const => Ok(CONSTANT_ADDRESS_SPACE),
         ast::StateSpace::Shared => Ok(SHARED_ADDRESS_SPACE),
-        ast::StateSpace::SharedCta => Err(error_todo()),
+        // .shared::cta names shared memory at thread block scope, which is what
+        // plain .shared already is on any target without thread block clusters;
+        // the qualifier only becomes a distinction next to .shared::cluster.
+        // Every other pass already groups the two together, so this mapping was
+        // the one place left where a module using it could not be translated --
+        // and sm_120 PTX writes `ld.shared::cta.v4.u32` where older PTX wrote
+        // `ld.shared.v4.u32`.
+        ast::StateSpace::SharedCta => Ok(SHARED_ADDRESS_SPACE),
         ast::StateSpace::SharedCluster => Err(error_todo()),
     }
 }

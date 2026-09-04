@@ -1,6 +1,6 @@
 [submodule "ext/llvm-project"]
 	path = ext/llvm-project
-	url = https://github.com/vosen/llvm-project.git
+	url = https://github.com/RedDukeDev/llvm-project.git
 	branch = main
 	shallow = true
 [submodule "ext/HiGHS"]

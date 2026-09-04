@@ -5,6 +5,7 @@ use super::{
 use crate::{
     BmskMode, CacheLevel, EvictionPriority, FunnelShiftMode, MatrixLayout, MatrixNumber,
     MatrixShape, Mul24Control, PtxError, PtxParserState, Reduction, ShiftDirection, ShuffleMode,
+    SustClamp,
     VoteMode, VshOp,
 };
 use bitflags::bitflags;
@@ -205,6 +206,38 @@ ptx_parser_macros::generate_instruction_type!(
             },
             display: write!(f, "bra")?
         },
+        WmmaMma {
+            type: !,
+            data: MmaDetails,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: { Type::Vector(4, ScalarType::B32) },
+                },
+                src1: {
+                    repr: T,
+                    type: { Type::Vector(8, ScalarType::B32) },
+                },
+                src2: {
+                    repr: T,
+                    type: { Type::Vector(8, ScalarType::B32) },
+                },
+                src3: {
+                    repr: T,
+                    type: { Type::Vector(4, ScalarType::B32) },
+                },
+            }
+        },
+        MovMatrix {
+            // .b16 names the element type; the operands themselves are one .b32
+            // register per lane, holding two elements.
+            type: Type::Scalar(ScalarType::B32),
+            data: ScalarType,
+            arguments<T>: {
+                dst: T,
+                src: T
+            }
+        },
         Brev {
             type: Type::Scalar(data.clone()),
             data: ScalarType,
@@ -251,6 +284,123 @@ ptx_parser_macros::generate_instruction_type!(
                     repr: T,
                     space: StateSpace::Global
                 }
+            }
+        },
+        // min with the result clamped at zero. PTX spells it as a modifier on
+        // min, but it is a distinct operation -- max(min(a, b), 0) -- and the
+        // details type for min carries no room for a flag. Only the signed 32
+        // bit form is here because it is the only one the networks use; .relu
+        // also exists on max and on the floating point forms.
+        MinRelu {
+            type: { &data.type_ },
+            data: MinReluDetails,
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: T
+            }
+        },
+        // The vector reduction: an atomic add over consecutive packed words whose
+        // result nobody reads. It is not one wide atomic -- no hardware has a
+        // sixteen byte floating point add -- so the values travel as a vector of
+        // 32 bit words and are added one word at a time; see the emission.
+        RedVector {
+            type: { &data.type_ },
+            data: RedVectorDetails,
+            arguments<T>: {
+                src_address: {
+                    repr: T,
+                    space: StateSpace::Global
+                },
+                src_values: T
+            }
+        },
+        // The bulk asynchronous copy, and the transaction barrier it completes
+        // on. There is no equivalent on AMD, so all of this is emulated: the
+        // copy runs synchronously and the barrier is a plain block barrier.
+        // That is sound -- a wait for a transfer that has already happened is
+        // trivially satisfied -- and it is the same shape as the emulation
+        // already used for plain cp.async, whose commit/wait groups are no-ops.
+        CpAsyncBulk {
+            // Both addresses are read as operands -- the destination is memory,
+            // not a register the instruction produces -- so they carry the
+            // `src_` prefix, exactly as plain cp.async does.
+            type: Type::Scalar(ScalarType::U32),
+            arguments<T>: {
+                src_to: {
+                    repr: T,
+                    space: StateSpace::Shared
+                },
+                src_from: {
+                    repr: T,
+                    space: StateSpace::Global
+                },
+                src_size: T,
+                src_barrier: {
+                    repr: T,
+                    space: StateSpace::Shared
+                }
+            }
+        },
+        MbarrierInit {
+            type: Type::Scalar(ScalarType::U32),
+            arguments<T>: {
+                src_barrier: {
+                    repr: T,
+                    space: StateSpace::Shared
+                },
+                src_count: T
+            }
+        },
+        MbarrierExpectTx {
+            type: Type::Scalar(ScalarType::U32),
+            arguments<T>: {
+                src_barrier: {
+                    repr: T,
+                    space: StateSpace::Shared
+                },
+                src_count: T
+            }
+        },
+        MbarrierArrive {
+            // The arrival token is 64 bit, but the count that comes with it is
+            // an ordinary 32 bit value: `mbarrier.arrive...b64 %rd, [%r], %r`.
+            type: Type::Scalar(ScalarType::U64),
+            arguments<T>: {
+                dst: T,
+                src_barrier: {
+                    repr: T,
+                    space: StateSpace::Shared
+                },
+                src_count: {
+                    repr: T,
+                    type: Type::Scalar(ScalarType::U32)
+                }
+            }
+        },
+        MbarrierTryWait {
+            type: Type::Scalar(ScalarType::U64),
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: Type::Scalar(ScalarType::Pred)
+                },
+                src_barrier: {
+                    repr: T,
+                    space: StateSpace::Shared
+                },
+                src_state: T
+            }
+        },
+        ElectSync {
+            type: Type::Scalar(ScalarType::B32),
+            arguments<T>: {
+                dst: T,
+                dst_pred: {
+                    repr: T,
+                    type: Type::Scalar(ScalarType::Pred)
+                },
+                src_membermask: T
             }
         },
         CpAsyncCommitGroup { },
@@ -911,6 +1061,40 @@ ptx_parser_macros::generate_instruction_type!(
                 src3: T
             }
         },
+        Sust {
+            type: !,
+            data: SustData,
+            arguments<T>: {
+                src_ptr: {
+                    repr: T,
+                    type: {
+                        if data.type_ == TexType::Texref {
+                            Type::Texref
+                        } else {
+                            Type::Scalar(ScalarType::U64)
+                        }
+                    },
+                    space: {
+                        if data.type_ == TexType::Texref {
+                            StateSpace::Global
+                        } else {
+                            StateSpace::Reg
+                        }
+                    },
+
+                },
+                src_coord: {
+                    repr: T,
+                    type: { data.coord_type() },
+
+                },
+                src_data: {
+                    repr: T,
+                    type: { data.value_type() },
+                    relaxed_type_check: true,
+                },
+            }
+        },
         Tex {
             type: !,
             data: TexData,
@@ -941,6 +1125,11 @@ ptx_parser_macros::generate_instruction_type!(
                 src_coord:  {
                     repr: T,
                     type: { data.coord_type() },
+
+                },
+                src_lod:  {
+                    repr: Option<T>,
+                    type: { Type::Scalar(ScalarType::F32) },
 
                 },
             }
@@ -1067,6 +1256,7 @@ where
                 imm,
             ),
             ParsedOperand::Imm(imm) => ParsedOperand::Imm(imm),
+            ParsedOperand::Sink => ParsedOperand::Sink,
             ParsedOperand::VecMember(ident, index) => ParsedOperand::VecMember(
                 (self)(ident, type_space, is_dst, relaxed_type_check)?,
                 index,
@@ -1082,6 +1272,7 @@ where
                                 relaxed_type_check,
                             )?),
                             RegOrImmediate::Imm(imm) => RegOrImmediate::Imm(imm),
+                            RegOrImmediate::Sink => RegOrImmediate::Sink,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -1368,7 +1559,7 @@ impl ScalarType {
     }
     pub fn size_of(self) -> u8 {
         match self {
-            ScalarType::U8 | ScalarType::S8 | ScalarType::B8 => 1,
+            ScalarType::U8 | ScalarType::S8 | ScalarType::B8 | ScalarType::E4m3 => 1,
             ScalarType::U16
             | ScalarType::S16
             | ScalarType::B16
@@ -1396,7 +1587,9 @@ impl ScalarType {
 
     pub fn layout(self) -> Layout {
         match self {
-            ScalarType::U8 | ScalarType::S8 | ScalarType::B8 => Layout::new::<u8>(),
+            ScalarType::U8 | ScalarType::S8 | ScalarType::B8 | ScalarType::E4m3 => {
+                Layout::new::<u8>()
+            }
             ScalarType::U16
             | ScalarType::S16
             | ScalarType::B16
@@ -1446,6 +1639,7 @@ impl ScalarType {
             ScalarType::BF16x2 => ScalarKind::Float,
             ScalarType::E4m3x2 => ScalarKind::Float,
             ScalarType::E5m2x2 => ScalarKind::Float,
+            ScalarType::E4m3 => ScalarKind::Float,
             ScalarType::Pred => ScalarKind::Pred,
         }
     }
@@ -1475,7 +1669,8 @@ impl ScalarType {
             | ScalarType::B128
             | ScalarType::U16
             | ScalarType::F64
-            | ScalarType::F16 => None,
+            | ScalarType::F16
+            | ScalarType::E4m3 => None,
         }
     }
 }
@@ -1553,6 +1748,11 @@ pub struct ShfDetails {
 pub enum RegOrImmediate<Ident> {
     Reg(Ident),
     Imm(ImmediateValue),
+    // The sink, written `_`. Inside a vector destination it means "discard this
+    // element": `mov.b64 {%r1, _}, %rd1` keeps only the low half. It is a
+    // destination, never a source, and carries no name to resolve, so it is
+    // kept distinct from a register rather than invented as one.
+    Sink,
 }
 
 #[derive(Clone)]
@@ -1562,6 +1762,10 @@ pub enum ParsedOperand<Ident> {
     Imm(ImmediateValue),
     VecMember(Ident, u8),
     VecPack(Vec<RegOrImmediate<Ident>>),
+    // The sink, `_`, as a whole operand rather than as a vector element:
+    // `elect.sync _|%p, %r` discards the elected lane and keeps only the
+    // predicate. Like the vector form it is a destination and carries no name.
+    Sink,
 }
 
 impl<Ident> ParsedOperand<Ident> {
@@ -1592,6 +1796,7 @@ where
                 };
                 write!(f, "{}.{}", id, suffix)?
             }
+            ParsedOperand::Sink => f.write_char('_')?,
             ParsedOperand::VecPack(items) => {
                 f.write_char('{')?;
                 for (idx, item) in items.iter().enumerate() {
@@ -1784,6 +1989,9 @@ pub struct ArithFloat {
     pub rounding: RoundingMode,
     pub flush_to_zero: Option<bool>,
     pub saturate: bool,
+    // .relu clamps the result to [0, +inf), mapping NaN to 0. It is mutually
+    // exclusive with .sat, which clamps to [0, 1].
+    pub relu: bool,
     // From PTX documentation: https://docs.nvidia.com/cuda/parallel-thread-execution/#mixed-precision-floating-point-instructions-add
     // Note that an add instruction with an explicit rounding modifier is treated conservatively by
     // the code optimizer. An add instruction with no rounding modifier defaults to
@@ -1801,6 +2009,9 @@ impl std::fmt::Display for ArithFloat {
         }
         if self.saturate {
             write!(f, ".sat")?;
+        }
+        if self.relu {
+            write!(f, ".relu")?;
         }
         write!(f, "{}", self.type_)?;
         Ok(())
@@ -2693,6 +2904,21 @@ pub struct BarRedData {
     pub pred_reduction: Reduction,
 }
 
+pub struct MinReluDetails {
+    pub type_: Type,
+    pub scalar: ScalarType,
+}
+
+pub struct RedVectorDetails {
+    // What the values arrive as: a vector of that many 32 bit words.
+    pub type_: Type,
+    // What each word really holds, which is what the add is performed on.
+    pub element: ScalarType,
+    pub count: u8,
+    pub semantics: AtomSemantics,
+    pub scope: MemScope,
+}
+
 pub struct AtomDetails {
     pub type_: Type,
     pub semantics: AtomSemantics,
@@ -2823,28 +3049,38 @@ pub struct MmaDetails {
     pub blayout: MatrixLayout,
     pub cd_type_scalar: ScalarType,
     pub ab_type_scalar: ScalarType,
+    // The k of the shape: 8 and 16 for the floating point forms, 32 for s8.
+    // It decides how many registers the A and B fragments take.
+    pub k: u8,
 }
 
 impl MmaDetails {
-    pub fn dtype(&self) -> Type {
-        if self.cd_type_scalar.kind() == ScalarKind::Float {
-            Type::Vector(4, ScalarType::F32)
-        } else {
-            Type::Vector(4, ScalarType::U32)
+    // A .f16 accumulator packs the four C/D values into two 32 bit registers,
+    // every other accumulator type spends one register per value.
+    fn cd_type(&self) -> Type {
+        match self.cd_type_scalar {
+            ScalarType::F16 => Type::Vector(2, ScalarType::B32),
+            t if t.kind() == ScalarKind::Float => Type::Vector(4, ScalarType::F32),
+            _ => Type::Vector(4, ScalarType::U32),
         }
+    }
+    pub fn dtype(&self) -> Type {
+        self.cd_type()
     }
     pub fn atype(&self) -> Type {
-        Type::Vector(4, ScalarType::U32)
+        match self.k {
+            8 => Type::Vector(2, ScalarType::U32),
+            _ => Type::Vector(4, ScalarType::U32),
+        }
     }
     pub fn btype(&self) -> Type {
-        Type::Vector(2, ScalarType::U32)
+        match self.k {
+            8 => Type::Vector(1, ScalarType::U32),
+            _ => Type::Vector(2, ScalarType::U32),
+        }
     }
     pub fn ctype(&self) -> Type {
-        if self.cd_type_scalar.kind() == ScalarKind::Float {
-            Type::Vector(4, ScalarType::F32)
-        } else {
-            Type::Vector(4, ScalarType::U32)
-        }
+        self.cd_type()
     }
 }
 
@@ -2882,11 +3118,45 @@ pub enum TexDimensions {
     D3,
 }
 
+pub struct SustData {
+    pub type_: TexType,
+    pub dims: TexDimensions,
+    // .p converts the values to the surface format and takes the x coordinate in
+    // samples. .b writes raw bits with x in bytes, and is not handled yet.
+    pub formatted: bool,
+    pub vector: Option<NonZeroU8>,
+    pub scalar_type: ScalarType,
+    // Out-of-range behaviour. AMD image stores drop such writes, which is what
+    // .zero asks for, so today every value lowers the same way; the field is kept
+    // so the lowering can tell them apart once .trap is worth honouring.
+    pub clamp: SustClamp,
+}
+
+impl SustData {
+    pub fn coord_type(&self) -> Type {
+        let dims = match self.dims {
+            TexDimensions::D1 => 1,
+            TexDimensions::D2 => 2,
+            TexDimensions::D3 => 4,
+        };
+        Type::Vector(dims, ScalarType::S32)
+    }
+    pub fn value_type(&self) -> Type {
+        Type::maybe_vector_parsed(self.vector, self.scalar_type)
+    }
+}
+
 pub struct TexData {
     pub type_: TexType,
     pub dtype: ScalarType,
     pub ctype: ScalarType,
     pub dims: TexDimensions,
+    // .level takes an explicit LOD operand. Without it the base level is used,
+    // which is what .base asks for and also the default with no mode qualifier.
+    pub level: bool,
+    // tld4 gathers one component from the four texels of the 2x2 footprint;
+    // the value is the component index, 0 for .r through 3 for .a.
+    pub gather: Option<u8>,
 }
 
 impl TexData {

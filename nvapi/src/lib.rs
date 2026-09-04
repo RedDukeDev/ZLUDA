@@ -33,13 +33,14 @@ interface_to_name!(
     // { NvAPI_OGL_ExpertModeGet, 0x22ed9516 },
     // { NvAPI_OGL_ExpertModeDefaultsSet, 0xb47a657e },
     // { NvAPI_OGL_ExpertModeDefaultsGet, 0xae921f12 },
-    // { NvAPI_EnumPhysicalGPUs, 0xe5ac921f },
+    { NvAPI_EnumPhysicalGPUs, 0xe5ac921f },
+    { NvAPI_GPU_GetArchInfo, 0xd8265d24 },
     // { NvAPI_EnumTCCPhysicalGPUs, 0xd9930b07 },
     // { NvAPI_EnumLogicalGPUs, 0x48b3ea59 },
     // { NvAPI_GetPhysicalGPUsFromDisplay, 0x34ef9506 },
     // { NvAPI_GetPhysicalGPUFromUnAttachedDisplay, 0x5018ed61 },
     // { NvAPI_GetLogicalGPUFromDisplay, 0xee1370cf },
-    // { NvAPI_GetLogicalGPUFromPhysicalGPU, 0xadd604d1 },
+    { NvAPI_GetLogicalGPUFromPhysicalGPU, 0xadd604d1 },
     // { NvAPI_GetPhysicalGPUsFromLogicalGPU, 0xaea3fa32 },
     { NvAPI_GetPhysicalGPUFromGPUID, 0x5380ad1a },
     { NvAPI_GetGPUIDfromPhysicalGPU, 0x6533ea3e },
@@ -75,7 +76,6 @@ interface_to_name!(
     // { NvAPI_GPU_GetQuadroStatus, 0xe332fa47 },
     // { NvAPI_GPU_GetBoardInfo, 0x22d54523 },
     // { NvAPI_GPU_GetRamBusWidth, 0x7975c581 },
-    // { NvAPI_GPU_GetArchInfo, 0xd8265d24 },
     // { NvAPI_I2CRead, 0x2fde12c5 },
     // { NvAPI_I2CWrite, 0xe812eb07 },
     // { NvAPI_GPU_WorkstationFeatureSetup, 0x6c1f3fe4 },
@@ -99,7 +99,7 @@ interface_to_name!(
     // { NvAPI_GPU_GetScanoutConfigurationEx, 0xe2e1e6f0 },
     // { NvAPI_GPU_GetAdapterIdFromPhysicalGpu, 0x0ff07fde },
     // { NvAPI_GPU_GetVirtualizationInfo, 0x44e022a9 },
-    // { NvAPI_GPU_GetLogicalGpuInfo, 0x842b066e },
+    { NvAPI_GPU_GetLogicalGpuInfo, 0x842b066e },
     // { NvAPI_GPU_GetLicensableFeatures, 0x3fc596aa },
     // { NvAPI_GPU_GetEncoderStatistics, 0xf0a9aeeb },
     // { NvAPI_GPU_GetEncoderSessionsInfo, 0xd8a72ce5 },
@@ -654,6 +654,146 @@ unsafe fn NvAPI_GPU_CudaEnumComputeCapableGpus_v2(
     });
     compute_topo.gpuCount = 1;
     compute_topo.computeGpus = (&raw mut FAKE_GPU).cast();
+    0
+}
+
+// DLSS asks NVAPI which GPUs exist, matches one by LUID, and reads its
+// architecture. With none of that answered it counts zero GPUs and falls back to
+// NV_GPU_ARCHITECTURE_GK100 (224 = 0xE0, Kepler) -- an architecture with no
+// tensor cores, which is why the transformer evaluation refuses to run even
+// though creating the feature succeeds.
+//
+// One GPU is reported, using the same fake handle value 1 that
+// NvAPI_GPU_CudaEnumComputeCapableGpus already hands out.
+
+// Reads the adapter LUID from the CUDA driver already loaded in this process.
+// GetModuleHandleW rather than LoadLibraryW: if nvcuda is not there yet then
+// nothing has asked us about GPUs for a reason that matters.
+unsafe fn cuda_device_luid(luid: &mut [i8; 8], node_mask: &mut u32) -> bool {
+    let nvcuda = winapi_get_module(b"nvcuda.dll\0");
+    if nvcuda.is_null() {
+        return false;
+    }
+    let get_luid = winapi_get_proc(nvcuda, b"cuDeviceGetLuid\0");
+    let device_get = winapi_get_proc(nvcuda, b"cuDeviceGet\0");
+    if get_luid.is_null() || device_get.is_null() {
+        return false;
+    }
+    let device_get: unsafe extern "C" fn(*mut i32, i32) -> i32 = std::mem::transmute(device_get);
+    let get_luid: unsafe extern "C" fn(*mut i8, *mut u32, i32) -> i32 = std::mem::transmute(get_luid);
+    let mut dev = 0i32;
+    if device_get(&mut dev, 0) != 0 {
+        return false;
+    }
+    get_luid(luid.as_mut_ptr(), node_mask, dev) == 0
+}
+
+extern "system" {
+    fn GetModuleHandleA(name: *const u8) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+}
+
+unsafe fn winapi_get_module(name: &[u8]) -> *mut c_void {
+    GetModuleHandleA(name.as_ptr())
+}
+
+unsafe fn winapi_get_proc(module: *mut c_void, name: &[u8]) -> *mut c_void {
+    GetProcAddress(module, name.as_ptr())
+}
+
+const FAKE_PHYSICAL_GPU: NvPhysicalGpuHandle = 1 as NvPhysicalGpuHandle;
+const FAKE_LOGICAL_GPU: NvLogicalGpuHandle = 1 as NvLogicalGpuHandle;
+
+#[allow(non_snake_case)]
+unsafe extern "C" fn NvAPI_EnumPhysicalGPUs(
+    gpu_handles: *mut NvPhysicalGpuHandle,
+    gpu_count: *mut NvU32,
+) -> i32 {
+    let gpu_count = unwrap_or::unwrap_some_or!(
+        gpu_count.as_mut(),
+        return _NvAPI_Status_NVAPI_INVALID_ARGUMENT
+    );
+    if gpu_handles.is_null() {
+        return _NvAPI_Status_NVAPI_INVALID_ARGUMENT;
+    }
+    *gpu_handles = FAKE_PHYSICAL_GPU;
+    *gpu_count = 1;
+    0
+}
+
+#[allow(non_snake_case)]
+unsafe extern "C" fn NvAPI_GetLogicalGPUFromPhysicalGPU(
+    _physical_gpu: NvPhysicalGpuHandle,
+    logical_gpu: *mut NvLogicalGpuHandle,
+) -> i32 {
+    let logical_gpu = unwrap_or::unwrap_some_or!(
+        logical_gpu.as_mut(),
+        return _NvAPI_Status_NVAPI_INVALID_ARGUMENT
+    );
+    *logical_gpu = FAKE_LOGICAL_GPU;
+    0
+}
+
+#[allow(non_snake_case)]
+unsafe extern "C" fn NvAPI_GPU_GetLogicalGpuInfo(
+    _logical_gpu: NvLogicalGpuHandle,
+    data: *mut NV_LOGICAL_GPU_DATA,
+) -> i32 {
+    let data = unwrap_or::unwrap_some_or!(
+        data.as_mut(),
+        return _NvAPI_Status_NVAPI_INVALID_ARGUMENT
+    );
+    // The caller matches this LUID against the one cuDeviceGetLuid reports, so
+    // the two have to agree exactly. Rather than duplicate the derivation, ask
+    // the CUDA driver that is already in the process.
+    if !data.pOSAdapterId.is_null() {
+        let mut luid = [0i8; 8];
+        let mut node_mask: u32 = 0;
+        if cuda_device_luid(&mut luid, &mut node_mask) {
+            std::ptr::copy_nonoverlapping(
+                luid.as_ptr().cast::<u8>(),
+                data.pOSAdapterId.cast::<u8>(),
+                8,
+            );
+        }
+    }
+    data.physicalGpuCount = 1;
+    data.physicalGpuHandles[0] = FAKE_PHYSICAL_GPU;
+    0
+}
+
+#[allow(non_snake_case)]
+unsafe extern "C" fn NvAPI_GPU_GetArchInfo(
+    _physical_gpu: NvPhysicalGpuHandle,
+    arch_info: *mut NV_GPU_ARCH_INFO_V1,
+) -> i32 {
+    let arch_info = unwrap_or::unwrap_some_or!(
+        arch_info.as_mut(),
+        return _NvAPI_Status_NVAPI_INVALID_ARGUMENT
+    );
+    // Which architecture to claim is not a free choice: the snippets gate
+    // features on it. Ada (400) is the default because it matches the sm_89 PTX
+    // the DLSS snippets ship and is the architecture whose kernels ZLUDA has
+    // been made to compile.
+    //
+    // Neural rendering refuses to create its feature below GB200 (432):
+    // nvngx_dlssnr.dll+0x17E94 reads the architecture, and every value from 320
+    // to 416 lands on a rejection with 0xBAD00001, logging 432 as what it
+    // wanted. Claiming 432 is the only way to get past that, so the value is
+    // settable -- ZLUDA_NVAPI_GPU_ARCH, decimal or 0x-prefixed hex.
+    arch_info.architecture = std::env::var("ZLUDA_NVAPI_GPU_ARCH")
+        .ok()
+        .and_then(|value| {
+            let value = value.trim().to_string();
+            match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => value.parse::<u32>().ok(),
+            }
+        })
+        .unwrap_or(_NV_GPU_ARCHITECTURE_ID_NV_GPU_ARCHITECTURE_AD100 as NvU32);
+    // version is left exactly as the caller set it.
+    arch_info.implementation = 0;
+    arch_info.revision = 0;
     0
 }
 
