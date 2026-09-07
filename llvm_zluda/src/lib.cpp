@@ -9,9 +9,14 @@
 #include <llvm/Support/raw_ostream.h>
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
+#include <llvm/IR/Module.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Transforms/Utils/SplitModule.h>
 #pragma GCC diagnostic pop
 
 #include <mutex>
+#include <string>
 
 // Declare that we want to use the ELF driver
 LLD_HAS_DRIVER(elf)
@@ -208,6 +213,69 @@ void LLVMZludaSetAtomic(
     {
         llvm_unreachable("Invalid instruction type for LLVMZludaSetAtomic");
     }
+}
+
+// Cuts a module into parts for code generation, writing each as bitcode to
+// "<path_prefix><n>.bc" and returning how many were written.
+//
+// Code generation is where a translation spends its time: measured on the
+// largest module of the DLSS network, 1444 seconds out of 1753, all on one
+// thread. The parts can be generated on as many threads as the machine has,
+// and are linked back together afterwards -- LLVMZludaLinkWithLLD below
+// already takes a list of objects.
+//
+// Bitcode on disk rather than modules in memory because an LLVMContext belongs
+// to the thread that made it: each worker parses its own part into a context of
+// its own, and files also make a part easy to look at when a part is what
+// misbehaves.
+//
+// Locals are preserved, which keeps every user of an internal symbol inside one
+// part. Shared-memory globals are the reason: the AMDGPU backend allocates
+// those per module, so a kernel must not be separated from the ones it shares
+// them with.
+extern "C" uint32_t LLVMZludaSplitModule(LLVMModuleRef M, uint32_t parts,
+                                         const char *path_prefix, char **ErrorMessage)
+{
+    uint32_t written = 0;
+    std::string prefix(path_prefix);
+    std::string failure;
+
+    llvm::SplitModule(
+        *llvm::unwrap(M), parts,
+        [&](std::unique_ptr<llvm::Module> part)
+        {
+            if (!failure.empty())
+            {
+                return;
+            }
+            std::error_code ec;
+            std::string path = prefix + std::to_string(written) + ".bc";
+            llvm::raw_fd_ostream out(path, ec, llvm::sys::fs::OF_None);
+            if (ec)
+            {
+                failure = ec.message();
+                return;
+            }
+            llvm::WriteBitcodeToFile(*part, out);
+            out.flush();
+            if (out.has_error())
+            {
+                failure = "could not write " + path;
+                return;
+            }
+            ++written;
+        },
+        /*PreserveLocals=*/true);
+
+    if (!failure.empty())
+    {
+        if (ErrorMessage != nullptr)
+        {
+            *ErrorMessage = strdup(failure.c_str());
+        }
+        return 0;
+    }
+    return written;
 }
 
 std::mutex lld_mutex;
