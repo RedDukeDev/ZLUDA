@@ -276,10 +276,19 @@ fn get_best_ptx_and_compile(
         })(),
         _ => None,
     };
-    let cached_binary = load_cached_binary(&mut cache_with_key);
-    let (elf_module, sm_version, zluda32) = cached_binary
-        .ok_or(CUerror::UNKNOWN)
-        .or_else(|_| compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key))?;
+    // How many kernels the PTX asks for. Both the cache and the translation are
+    // held to it: an object with none of them is not an answer.
+    let kernels_wanted = count_kernels_declared(&module);
+    let cached_binary = load_cached_binary(&mut cache_with_key, kernels_wanted);
+    let (elf_module, sm_version, zluda32) = cached_binary.ok_or(CUerror::UNKNOWN).or_else(|_| {
+        compile_and_cache(
+            gcn_arch,
+            attributes,
+            module,
+            kernels_wanted,
+            &mut cache_with_key,
+        )
+    })?;
     let mut hip_module = unsafe { mem::zeroed() };
     unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
     Ok((hip_module, sm_version, zluda32))
@@ -338,12 +347,42 @@ fn get_cache_key<'a, 'b>(
     })
 }
 
+fn count_kernels_declared(module: &ptx_parser::Module) -> usize {
+    module
+        .directives
+        .iter()
+        .filter(|directive| match directive {
+            ptx_parser::Directive::Method(_, function) => function.func_directive.name.is_kernel(),
+            _ => false,
+        })
+        .count()
+}
+
 fn load_cached_binary(
     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
+    kernels_wanted: usize,
 ) -> Option<(Vec<u8>, u32, Option<Metadata32Bit>)> {
     let binary = cache_with_key
         .as_mut()
         .and_then(|(c, key)| c.get_module_binary(key))?;
+    // An entry with none of the kernels the PTX declares cannot be right, and
+    // one such entry is in the everyday cache to this day: the same PTX that
+    // gives a 14 MB object under one build gave a 2312-byte one under another,
+    // with a .text of length zero and not a symbol in it. It was stored under a
+    // perfectly good key, so every run afterwards was handed it back and every
+    // kernel in that module was NOT_FOUND, with nothing to say why. Throwing it
+    // out here turns that into one slow run instead of a cache that has to be
+    // deleted by hand.
+    if kernels_wanted > 0 && kernel_metadata::count_kernels(&binary).unwrap_or(0) == 0 {
+        eprintln!(
+            "[zluda] the cached translation of this module has no kernels in it, though the PTX declares {}. Dropping it and translating again.",
+            kernels_wanted
+        );
+        if let Some((cache, key)) = cache_with_key.as_mut() {
+            cache.remove_module(key);
+        }
+        return None;
+    }
     let sm_version = kernel_metadata::ModuleMetadataV1::read_object(&binary)?
         .sm_version
         .to_native();
@@ -356,6 +395,7 @@ fn compile_and_cache(
     gcn_arch: &str,
     attributes: ExtraCacheAttributes,
     ast: ptx_parser::Module,
+    kernels_wanted: usize,
     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
 ) -> Result<(Vec<u8>, u32, Option<Metadata32Bit>), CUerror> {
     let llvm_module = ptx::to_llvm_module(
@@ -409,6 +449,26 @@ fn compile_and_cache(
         }
         CUerror::UNKNOWN
     })?;
+    // A translation can come back successful and empty, and one that does must
+    // not be written down.
+    //
+    // The everyday cache still holds an example: the same PTX that gives a
+    // 14 MB object under one build gave a 2312-byte one under another, with a
+    // .text of length zero and not one symbol in it. Nothing complained. It was
+    // stored under a perfectly good key, so every run afterwards got it back
+    // and every kernel in that module was NOT_FOUND -- with nothing to say why,
+    // and no way out short of deleting the cache by hand.
+    //
+    // Failing here instead costs a translation that was worthless anyway, and
+    // says what happened while there is still something to say it about.
+    let kernels_built = kernel_metadata::count_kernels(&elf_module).unwrap_or(0);
+    if kernels_wanted > 0 && kernels_built == 0 {
+        eprintln!(
+            "[zluda] this module translated to an object with no kernels in it: {} were declared in the PTX and none came out. Not caching it.",
+            kernels_wanted
+        );
+        return Err(CUerror::UNKNOWN);
+    }
     if let Some((cache, key)) = cache_with_key {
         key.last_access = zluda_cache::ModuleCache::time_now();
         cache.insert_module(key, &elf_module);
