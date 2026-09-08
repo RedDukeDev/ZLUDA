@@ -1,6 +1,6 @@
 use object::read::elf::FileHeader as _;
 use object::write::elf as elf_write;
-use object::{elf, Endian, Endianness, Object, ObjectSection};
+use object::{elf, Endian, Endianness, Object, ObjectSection, ObjectSymbol};
 use rkyv::api::high::HighSerializer;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
@@ -121,6 +121,35 @@ pub fn write_object(
     });
     writer_elf.write_shstrtab_section_header();
     writer.write_all(&buf)
+}
+
+// How many kernels a translated object actually defines.
+//
+// It is asked because a translation can come back successful and empty. One
+// sits in the everyday cache to this day: the same PTX that gives a 14 MB
+// object under one build gave, under another, a 2312-byte one with a .text of
+// length zero and not a single symbol -- and it was stored like any other
+// result, so from then on every kernel in that module was NOT_FOUND with
+// nothing to say why. Counting them makes the difference between a translation
+// that worked and one that dropped everything visible before it is written
+// down.
+//
+// A kernel on AMDGPU always carries a descriptor object named after it with
+// ".kd" on the end, so counting those counts kernels without having to know
+// anything else about the object.
+pub fn count_kernels(elf_bytes: &[u8]) -> Option<usize> {
+    let elf_file = object::read::elf::ElfFile64::<Endianness>::parse(elf_bytes).ok()?;
+    Some(
+        elf_file
+            .symbols()
+            .filter(|symbol| {
+                symbol
+                    .name()
+                    .map(|name| name.ends_with(".kd"))
+                    .unwrap_or(false)
+            })
+            .count(),
+    )
 }
 
 fn read_object<'a, T: Portable>(elf_bytes: &'a [u8], section: &str, version: u64) -> Option<&'a T> {

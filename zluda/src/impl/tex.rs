@@ -38,6 +38,11 @@ pub(crate) unsafe fn object_create(
             .map_err(|_| hipErrorCode_t::OperatingSystem)?
             .get_or_insert_with(HashMap::new)
             .insert(*p_tex_object as usize, (desc.resType.0, handle));
+        // A surface object over the same array has no sampler of its own, and
+        // a `tex` through one has to sample with something: this is the
+        // sampling the program asked for, so it is the right thing to give it.
+        // See the note in surf.rs for what happens without it.
+        super::surf::adopt_sampler(handle, *p_tex_object as usize);
     }
     Ok(())
 }
