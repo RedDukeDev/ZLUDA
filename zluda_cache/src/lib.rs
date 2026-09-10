@@ -9,6 +9,7 @@ pub(crate) mod schema;
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
+#[derive(Clone)]
 pub struct ModuleKey<'a> {
     pub hash: ArrayString<64>,
     pub compiler_version: &'static str,

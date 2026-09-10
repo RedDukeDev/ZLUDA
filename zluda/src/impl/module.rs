@@ -264,9 +264,11 @@ fn get_best_ptx_and_compile(
     // TODO: get this information on initialization
     let hip_properties = get_hip_properties()?;
     let gcn_arch = get_gcn_arch(&hip_properties)?;
+    let cumode = llvm_zluda::is_cumode(gcn_arch);
     let attributes = ExtraCacheAttributes {
         clock_rate: hip_properties.clockRate as u32,
         is_debug: cfg!(debug_assertions),
+        cumode,
     };
     let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
         (Some(text), Some(p)) => (|| {
@@ -279,7 +281,7 @@ fn get_best_ptx_and_compile(
     // How many kernels the PTX asks for. Both the cache and the translation are
     // held to it: an object with none of them is not an answer.
     let kernels_wanted = count_kernels_declared(&module);
-    let cached_binary = load_cached_binary(&mut cache_with_key, kernels_wanted);
+    let cached_binary = load_cached_binary(&mut cache_with_key, kernels_wanted, cumode);
     let (elf_module, sm_version, zluda32) = cached_binary.ok_or(CUerror::UNKNOWN).or_else(|_| {
         compile_and_cache(
             gcn_arch,
@@ -312,6 +314,7 @@ pub(crate) fn load_hip_module(
 struct ExtraCacheAttributes {
     is_debug: bool,
     clock_rate: u32,
+    cumode: bool,
 }
 
 fn get_hip_properties<'a>() -> Result<hipDeviceProp_tR0600, CUerror> {
@@ -361,10 +364,22 @@ fn count_kernels_declared(module: &ptx_parser::Module) -> usize {
 fn load_cached_binary(
     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
     kernels_wanted: usize,
+    cumode: bool,
 ) -> Option<(Vec<u8>, u32, Option<Metadata32Bit>)> {
-    let binary = cache_with_key
+    let mut binary = cache_with_key
         .as_mut()
-        .and_then(|(c, key)| c.get_module_binary(key))?;
+        .and_then(|(c, key)| c.get_module_binary(key));
+    if binary.is_none() && cumode {
+        if let Some((c, key)) = cache_with_key.as_mut() {
+            let legacy_backend_key = key.backend_key.replace(",\"cumode\":true", "");
+            if legacy_backend_key != key.backend_key {
+                let mut legacy_key = key.clone();
+                legacy_key.backend_key = legacy_backend_key;
+                binary = c.get_module_binary(&legacy_key);
+            }
+        }
+    }
+    let binary = binary?;
     // An entry with none of the kernels the PTX declares cannot be right, and
     // one such entry is in the everyday cache to this day: the same PTX that
     // gives a 14 MB object under one build gave a 2312-byte one under another,

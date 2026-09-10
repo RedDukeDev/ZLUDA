@@ -87,10 +87,22 @@ fn create_oclc_constants(ctx: &Context, gcn_arch: &str) -> Result<Module, String
     Ok(module)
 }
 
+pub fn is_cumode(gcn_arch: &str) -> bool {
+    match std::env::var("ZLUDA_CUMODE").ok().as_deref() {
+        Some("1" | "true" | "TRUE" | "cu" | "CU") => true,
+        Some("0" | "false" | "FALSE" | "wgp" | "WGP") => false,
+        _ => !(gcn_arch.starts_with("gfx10") || gcn_arch.starts_with("gfx11") || gcn_arch.starts_with("gfx12")),
+    }
+}
+
 fn make_target_machine(gcn_arch: &str) -> Result<TargetMachine, String> {
     let triple = c"amdgcn-amd-amdhsa";
     let cpu = CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
-    let features = c"-wavefrontsize64,+cumode";
+    let features = if is_cumode(gcn_arch) {
+        c"-wavefrontsize64,+cumode"
+    } else {
+        c"-wavefrontsize64,-cumode"
+    };
 
     let mut target = unsafe { std::mem::zeroed() };
     let mut err = ptr::null_mut();
@@ -129,20 +141,16 @@ fn run_optimizer(module: &Module, target_machine: &TargetMachine) -> Result<(), 
 }
 
 // How many parts to cut the module into before generating code, from
-// ZLUDA_CODEGEN_PARTS. Absent or below two keeps the whole module in one piece,
-// which is what every build did before this existed.
-//
-// Off by default on purpose: splitting narrows what the optimiser can see, so
-// the code that comes out is not the same code. Whether that costs anything at
-// run time has to be measured on the network, not assumed, and until it has
-// been the fast path stays opt-in.
+// ZLUDA_CODEGEN_PARTS. Defaults to available_parallelism to accelerate compilation.
 fn codegen_parts() -> u32 {
     match std::env::var("ZLUDA_CODEGEN_PARTS").ok().as_deref() {
         Some("auto") => std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1),
         Some(text) => text.parse().unwrap_or(1),
-        None => 1,
+        None => std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1),
     }
 }
 
