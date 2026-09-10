@@ -89,40 +89,30 @@ pub(crate) unsafe fn adopt_sampler(array: usize, texture: usize) {
         // with whatever HIP keeps at that offset, which reads as a network that
         // works some of the time and not others.
         //
-        // On RDNA (GFX10/GFX11), the hardware image descriptor is 8 DWORDs (32 bytes),
-        // whereas legacy GCN used 12 DWORDs (48 bytes). In modern Windows ROCm / HIP,
-        // the trailing bytes of the 48-byte region in surface objects contain runtime
-        // bookkeeping. Allow match if either the full 48-byte region matches or the
-        // core 32-byte hardware image descriptor matches:
-        let agrees_48 = onto[..SAMPLER_OFFSET] == from[..SAMPLER_OFFSET];
-        let agrees_32 = onto[..32] == from[..32];
+        // The same array through two objects has to describe the same image.
+        // On RDNA (GFX10/GFX11), byte 14 contains the resource access permissions
+        // (texture object is read-only 0xb0, surface object is read-write 0xbf).
+        // The high nibble (0xb0) encodes format/resource type, while the low
+        // nibble encodes read/write access permissions. Compare descriptors
+        // while masking out this expected permission difference:
+        let agrees_exact = onto[..SAMPLER_OFFSET] == from[..SAMPLER_OFFSET];
+        let agrees_masked = onto[..14] == from[..14]
+            && (onto[14] & 0xf0) == (from[14] & 0xf0)
+            && onto[15..SAMPLER_OFFSET] == from[15..SAMPLER_OFFSET];
 
-        if !agrees_48 && !agrees_32 {
+        if !agrees_exact && !agrees_masked {
             static COMPLAINED: std::sync::Once = std::sync::Once::new();
             COMPLAINED.call_once(|| {
                 eprintln!(
-                    "[zluda] a texture object and a surface object over the same array do not agree on their image descriptor (neither 48B nor 32B match), so the surface cannot be given a sampler. See the note in zluda/src/impl/surf.rs."
+                    "[zluda] a texture object and a surface object over the same array do not agree on their image descriptor, so the surface cannot be given a sampler. See the note in zluda/src/impl/surf.rs."
                 );
             });
             continue;
         }
 
-        // Determine sampler source offset: if from[48..64] contains the sampler, use 48;
-        // if from[32..48] contains the sampler, use 32. Default to SAMPLER_OFFSET (48).
-        let src_sampler_offset = if from[SAMPLER_OFFSET..SAMPLER_OFFSET + SAMPLER_BYTES]
-            .iter()
-            .any(|&b| b != 0)
-        {
-            SAMPLER_OFFSET
-        } else if from[32..32 + SAMPLER_BYTES].iter().any(|&b| b != 0) {
-            32
-        } else {
-            SAMPLER_OFFSET
-        };
-
         let _ = hipMemcpyHtoD(
             hipDeviceptr_t((object + SAMPLER_OFFSET) as *mut _),
-            from[src_sampler_offset..].as_ptr() as *mut _,
+            from[SAMPLER_OFFSET..].as_ptr() as *mut _,
             SAMPLER_BYTES,
         );
     }

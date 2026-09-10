@@ -340,7 +340,7 @@ fn get_cache_key<'a, 'b>(
     Some(zluda_cache::ModuleKey {
         hash: blake3::hash(text.as_bytes()).to_hex(),
         compiler_version: "builtin",
-        zluda_version: env!("VERGEN_GIT_SHA"),
+        zluda_version: "ea59191382b74add94d956261ec6c1bb469244a8",
         device: isa,
         backend_key: serialized_attributes,
         last_access: zluda_cache::ModuleCache::time_now(),
