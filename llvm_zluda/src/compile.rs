@@ -90,7 +90,7 @@ fn create_oclc_constants(ctx: &Context, gcn_arch: &str) -> Result<Module, String
 fn make_target_machine(gcn_arch: &str) -> Result<TargetMachine, String> {
     let triple = c"amdgcn-amd-amdhsa";
     let cpu = CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
-    let features = if gcn_arch.starts_with("gfx11") {
+    let features = if gcn_arch.starts_with("gfx11") || gcn_arch.starts_with("gfx12") {
         c"-wavefrontsize64,-cumode"
     } else {
         c"-wavefrontsize64,+cumode"
