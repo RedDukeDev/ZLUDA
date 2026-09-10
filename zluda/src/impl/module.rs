@@ -417,6 +417,7 @@ fn compile_and_cache(
         ast,
         ptx::Attributes {
             clock_rate: attributes.clock_rate,
+            cumode: llvm_zluda::is_cumode(gcn_arch),
         },
         |_| {},
     )

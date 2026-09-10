@@ -1343,6 +1343,7 @@ fn test_hip_assert<
         ast,
         pass::Attributes {
             clock_rate: 2124000,
+            cumode: true,
         },
         |_| {},
     )
@@ -1369,6 +1370,7 @@ fn test_zluda32_assert<
         ast,
         pass::Attributes {
             clock_rate: 2124000,
+            cumode: true,
         },
         |_| {},
     )
@@ -1389,6 +1391,7 @@ fn test_llvm_assert(
         ast,
         pass::Attributes {
             clock_rate: 2124000,
+            cumode: true,
         },
         |_| {},
     )

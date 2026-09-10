@@ -67,9 +67,10 @@ pub(crate) fn run<'input>(
     id_defs: GlobalStringIdentResolver2<'input>,
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
     fp_mode: FloatingPointMode,
+    cumode: bool,
 ) -> Result<llvm::Module, TranslateError> {
     let module = llvm::Module::new(context, LLVM_UNNAMED);
-    let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode);
+    let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode, cumode);
     for directive in directives {
         match directive {
             Directive2::Variable(linking, variable) => emit_ctx.emit_global(linking, variable)?,
@@ -91,6 +92,7 @@ struct ModuleEmitContext<'a, 'input> {
     id_defs: &'a GlobalStringIdentResolver2<'input>,
     resolver: ResolveIdent,
     fp_mode: FloatingPointMode,
+    cumode: bool,
 }
 
 impl<'a, 'input> ModuleEmitContext<'a, 'input> {
@@ -99,6 +101,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         module: &llvm::Module,
         id_defs: &'a GlobalStringIdentResolver2<'input>,
         fp_mode: FloatingPointMode,
+        cumode: bool,
     ) -> Self {
         ModuleEmitContext {
             context: context.get(),
@@ -107,6 +110,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             id_defs,
             resolver: ResolveIdent::new(&id_defs),
             fp_mode,
+            cumode,
         }
     }
 
@@ -364,8 +368,10 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 // not particularly important. The functions with .noreturn in
                 // PTX are noreturn in LLVM already
                 ptx_parser::TuningDirective::NoReturn => {}
-                // Not really applicable
-                ptx_parser::TuningDirective::MaxNReg(_) => {}
+                ptx_parser::TuningDirective::MaxNReg(regs) => {
+                    let value = format!("{regs}");
+                    self.emit_fn_attribute_string(fn_, "amdgpu-num-vgpr", &value);
+                }
                 ptx_parser::TuningDirective::MaxNtid(x, y, z) => {
                     let size = x * y * z;
                     let value = format!("1,{size}");
@@ -377,7 +383,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                     self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
                 }
                 ptx_parser::TuningDirective::MinNCtaPerSm(ctas) => {
-                    let value = format!("{ctas},1024");
+                    // In LLVM AMDGPU, amdgpu-waves-per-eu is validated by AMDGPUSubtarget::getWavesPerEU.
+                    // If the upper bound exceeds getMaxWavesPerEU() (16 on RDNA wave32), LLVM rejects
+                    // the entire attribute and falls back to Default(1, max). Passing a single integer
+                    // sets the minimum waves-per-EU while letting LLVM default max to getMaxWavesPerEU().
+                    let min_waves = (*ctas).clamp(1, 16);
+                    let value = format!("{min_waves}");
                     self.emit_fn_attribute_string(fn_, "amdgpu-waves-per-eu", &value);
                 }
             }
@@ -385,8 +396,10 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
     }
 
     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
+        let cumode_str = if self.cumode { "+cumode" } else { "-cumode" };
         let value = format!(
-            "+wavefrontsize32,-wavefrontsize64,+cumode{}",
+            "+wavefrontsize32,-wavefrontsize64,{}{}",
+            cumode_str,
             if cfg!(debug_assertions) {
                 ",+precise-memory"
             } else {

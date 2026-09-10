@@ -59,6 +59,7 @@ quick_error! {
 pub struct Attributes {
     /// Clock frequency in kHz.
     pub clock_rate: u32,
+    pub cumode: bool,
 }
 
 pub fn to_llvm_module<'input>(
@@ -119,7 +120,7 @@ pub fn to_llvm_module<'input>(
     let fp_mode = get_fp_mode(&directives[..]);
     on_pass_end("get_fp_mode");
     let context = llvm_zluda::utils::Context::new();
-    let llvm_ir = llvm::emit::run(&context, flat_resolver, directives, fp_mode)?;
+    let llvm_ir = llvm::emit::run(&context, flat_resolver, directives, fp_mode, attributes.cumode)?;
     let attributes_ir = llvm::attributes::run(&context, attributes)?;
     on_pass_end("emit_llvm");
     Ok(Module {
