@@ -95,7 +95,7 @@ pub(crate) fn launch_kernel(
     //
     // This is not a corner: DLSS launches every one of its kernels this way,
     // and refusing the form made cuLaunchKernel answer NOT_SUPPORTED.
-    let mut translated;
+    let mut translated = [std::ptr::null_mut(); 17];
     let extra = if extra.is_null() {
         extra
     } else {
@@ -103,7 +103,7 @@ pub(crate) fn launch_kernel(
         // list that is not terminated at all rather than a real limit; the
         // defined markers only allow two pairs.
         const MAX_ENTRIES: usize = 16;
-        translated = Vec::with_capacity(MAX_ENTRIES + 1);
+        let mut count = 0;
         unsafe {
             let mut i = 0;
             while i < MAX_ENTRIES {
@@ -111,8 +111,9 @@ pub(crate) fn launch_kernel(
                 if marker.is_null() {
                     break;
                 }
-                translated.push(marker);
-                translated.push(*extra.add(i + 1));
+                translated[count] = marker;
+                translated[count + 1] = *extra.add(i + 1);
+                count += 2;
                 i += 2;
             }
             if i >= MAX_ENTRIES {
@@ -121,7 +122,7 @@ pub(crate) fn launch_kernel(
         }
         // HIP_LAUNCH_PARAM_END. It is a macro in hip_runtime_api.h, so bindgen
         // does not carry it into hip_runtime-sys and it has to be spelled out.
-        translated.push(0x03 as *mut ::core::ffi::c_void);
+        translated[count] = 0x03 as *mut ::core::ffi::c_void;
         translated.as_mut_ptr()
     };
     unsafe {

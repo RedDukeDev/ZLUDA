@@ -1208,7 +1208,7 @@ extern "C"
         // It matters well beyond speed: without it every mma expands to the software
         // fallback inline, and a DLSS module with a thousand of them takes minutes to
         // compile.
-        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 12000)
+        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 13000)
         {
             [[clang::always_inline]] return __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a_reg, b_reg, c_reg);
         }
@@ -1277,7 +1277,7 @@ extern "C"
 
     float4::Native_vec_ FUNC(mma_sync_aligned_m16n8k16_row_col_f32_bf16_bf16_f32)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
     {
-        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 12000)
+        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 13000)
         {
             [[clang::always_inline]] return __llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32_optnone(a_reg, b_reg, c_reg);
         }
@@ -1297,7 +1297,7 @@ extern "C"
 
     uint4::Native_vec_ FUNC(mma_sync_aligned_m16n8k32_row_col_s32_s8_s8_s32)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg)
     {
-        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 12000)
+        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 13000)
         {
             [[clang::always_inline]] return __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32_optnone(a_reg, b_reg, c_reg);
         }
@@ -1416,7 +1416,7 @@ __device__ static inline float4::Native_vec_ fp8_mma_half(uint32_t a_row0, uint3
         f16x2 c01 = std::bit_cast<f16x2>(c_reg[0]);
         f16x2 c23 = std::bit_cast<f16x2>(c_reg[1]);
         float4::Native_vec_ d;
-        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 12000)
+        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 13000)
         {
             d = float4::Native_vec_{float(c01.x), float(c01.y), float(c23.x), float(c23.y)};
             d = fp8_mma_half(a_reg[0], a_reg[1], b_reg[0], d); // k 0..15
