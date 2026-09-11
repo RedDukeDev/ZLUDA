@@ -1,7 +1,6 @@
 use crate::r#impl::hipfix;
 use hip_runtime_sys::*;
 use std::collections::HashMap;
-use std::mem;
 use std::sync::Mutex;
 
 // hipTexObjectGetResourceDesc does not fill the driver style descriptor: the
@@ -10,10 +9,41 @@ use std::sync::Mutex;
 // during evaluation and refuses to proceed on the garbage it gets back.
 //
 // The descriptor is therefore remembered at creation time, exactly as
-// surf::object_create does. Only the resource type and its handle are kept:
-// those are the fields that identify the resource, and the rest of
-// HIP_RESOURCE_DESC is reserved.
-static TEXTURE_DESCS: Mutex<Option<HashMap<usize, (u32, usize)>>> = Mutex::new(None);
+// surf::object_create does.
+//
+// The whole descriptor is kept, not just the resource type and handle. Rebuilding
+// it from those two fields is only correct for the array forms: for
+// HIP_RESOURCE_TYPE_LINEAR it produced a descriptor whose `linear.devPtr` and
+// `linear.sizeInBytes` were zero, and `hipfix::refresh_texref` passes exactly
+// those to `hipTexRefSetAddress`, i.e. rebinding a texref to a null pointer.
+// `HIP_RESOURCE_DESC` is small and `Copy`, so storing it verbatim is simpler than
+// reproducing it and cannot be wrong for a resource type nobody thought of.
+static TEXTURE_DESCS: Mutex<Option<TextureDescs>> = Mutex::new(None);
+
+/// Wrapper that exists only so the map can be marked `Send`.
+///
+/// `HIP_RESOURCE_DESC` holds `hipArray_t` and friends, which are raw pointers, so
+/// the map is not automatically `Send` and cannot be given an `unsafe impl` of its
+/// own because it is a standard-library type.
+struct TextureDescs(HashMap<usize, HIP_RESOURCE_DESC>);
+
+// SAFETY: as in surf.rs, the pointers in these descriptors are opaque driver
+// handles rather than host memory this process owns, and they are already passed
+// across threads as plain `usize` elsewhere in this module. Every access is
+// serialised by the mutex, and an entry is removed when the object it names is
+// destroyed.
+unsafe impl Send for TextureDescs {}
+
+fn with_texture_descs<T>(body: impl FnOnce(&mut HashMap<usize, HIP_RESOURCE_DESC>) -> T) -> T {
+    // Poisoning is recovered rather than propagated, and the call is infallible:
+    // the map holds plain handles with no invariant a panic can break, and a
+    // locked mutex is not a reason to fail an object creation. See surf.rs.
+    let mut guard = match TEXTURE_DESCS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    body(&mut guard.get_or_insert_with(|| TextureDescs(HashMap::new())).0)
+}
 
 pub(crate) unsafe fn object_create(
     p_tex_object: *mut hipTextureObject_t,
@@ -21,27 +51,31 @@ pub(crate) unsafe fn object_create(
     p_tex_desc: *const HIP_TEXTURE_DESC,
     p_res_view_desc: *const HIP_RESOURCE_VIEW_DESC,
 ) -> hipError_t {
+    // Checked before the object exists rather than after: recording the
+    // descriptor is now unconditional, and a texture object that cannot be
+    // recorded has to be refused while refusing is still free. Reporting the
+    // failure afterwards would leak the object, because the caller never receives
+    // the handle it would have to destroy.
+    let desc = p_res_desc.as_ref().ok_or(hipErrorCode_t::InvalidValue)?;
     hipTexObjectCreate(p_tex_object, p_res_desc, p_tex_desc, p_res_view_desc)?;
-    if let Some(desc) = p_res_desc.as_ref() {
-        // Only the array forms carry a handle worth recording; a texture over
-        // linear or pitched memory keeps its type and reports a null resource,
-        // which is still better than the uninitialised value HIP leaves behind.
-        let handle = match desc.resType {
-            HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY => desc.res.array.hArray as usize,
-            HIPresourcetype::HIP_RESOURCE_TYPE_MIPMAPPED_ARRAY => {
-                desc.res.mipmap.hMipmappedArray as usize
-            }
-            _ => 0,
-        };
-        TEXTURE_DESCS
-            .lock()
-            .map_err(|_| hipErrorCode_t::OperatingSystem)?
-            .get_or_insert_with(HashMap::new)
-            .insert(*p_tex_object as usize, (desc.resType.0, handle));
-        // A surface object over the same array has no sampler of its own, and
-        // a `tex` through one has to sample with something: this is the
-        // sampling the program asked for, so it is the right thing to give it.
-        // See the note in surf.rs for what happens without it.
+    with_texture_descs(|descs| descs.insert(*p_tex_object as usize, *desc));
+    // Only the array forms name a resource a surface object can also be over.
+    let handle = match desc.resType {
+        HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY => desc.res.array.hArray as usize,
+        HIPresourcetype::HIP_RESOURCE_TYPE_MIPMAPPED_ARRAY => {
+            desc.res.mipmap.hMipmappedArray as usize
+        }
+        _ => 0,
+    };
+    if handle != 0 {
+        // Registered as well as adopted onto, because a surface object over this
+        // array may be created later and it is the one with no sampler at all;
+        // it has to be able to find this texture's. See the note in surf.rs.
+        super::surf::register_texture(handle, *p_tex_object as usize);
+        // And a surface object over the same array that already exists has no
+        // sampler of its own, while a `tex` through one has to sample with
+        // something: this is the sampling the program asked for, so it is the
+        // right thing to give it.
         super::surf::adopt_sampler(handle, *p_tex_object as usize);
     }
     Ok(())
@@ -51,31 +85,16 @@ pub(crate) unsafe fn object_get_resource_desc(
     p_res_desc: *mut HIP_RESOURCE_DESC,
     tex_object: hipTextureObject_t,
 ) -> hipError_t {
-    let (res_type, handle) = *TEXTURE_DESCS
-        .lock()
-        .map_err(|_| hipErrorCode_t::OperatingSystem)?
-        .as_ref()
-        .and_then(|m| m.get(&(tex_object as usize)))
+    let stored = with_texture_descs(|descs| descs.get(&(tex_object as usize)).copied())
         .ok_or(hipErrorCode_t::InvalidValue)?;
     let desc = p_res_desc.as_mut().ok_or(hipErrorCode_t::InvalidValue)?;
-    *desc = mem::zeroed();
-    desc.resType = HIPresourcetype(res_type);
-    match desc.resType {
-        HIPresourcetype::HIP_RESOURCE_TYPE_ARRAY => desc.res.array.hArray = handle as hipArray_t,
-        HIPresourcetype::HIP_RESOURCE_TYPE_MIPMAPPED_ARRAY => {
-            desc.res.mipmap.hMipmappedArray = handle as hipMipmappedArray_t
-        }
-        _ => {}
-    }
+    *desc = stored;
     Ok(())
 }
 
 pub(crate) unsafe fn object_destroy(tex_object: hipTextureObject_t) -> hipError_t {
-    if let Ok(mut descs) = TEXTURE_DESCS.lock() {
-        if let Some(descs) = descs.as_mut() {
-            descs.remove(&(tex_object as usize));
-        }
-    }
+    with_texture_descs(|descs| descs.remove(&(tex_object as usize)));
+    super::surf::unregister_texture(tex_object as usize);
     hipDestroyTextureObject(tex_object)
 }
 
