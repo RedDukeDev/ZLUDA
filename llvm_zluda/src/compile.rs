@@ -87,12 +87,121 @@ fn create_oclc_constants(ctx: &Context, gcn_arch: &str) -> Result<Module, String
     Ok(module)
 }
 
+/// `ZLUDA_CUMODE`, read once for the process.
+///
+/// `Some(true)` means CU mode, `Some(false)` means WGP mode, `None` means the
+/// caller should fall back to the per-architecture default.
+///
+/// Read once, not per call, because the same answer has to reach two places that
+/// must agree: the module cache key (`zluda/src/impl/module.rs` folds `cumode`
+/// into the serialised attributes) and the code generator, which reads it per
+/// kernel and per partition. If the variable were re-read at each of those
+/// points, a change in between would produce a binary whose target features no
+/// longer match the key it was stored under, and a build-A binary would answer
+/// for a build-B request.
+///
+/// An unrecognised value is reported rather than silently treated as "auto":
+/// getting WGP mode while believing you asked for CU mode is otherwise only
+/// discoverable by disassembling the result.
+fn cumode_override() -> Option<bool> {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let Ok(value) = std::env::var("ZLUDA_CUMODE") else {
+            return None;
+        };
+        if value.eq_ignore_ascii_case("1")
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("cu")
+        {
+            Some(true)
+        } else if value.eq_ignore_ascii_case("0")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("wgp")
+        {
+            Some(false)
+        } else {
+            eprintln!(
+                "[zluda] ZLUDA_CUMODE={:?} is not one of 1/true/cu/0/false/wgp; \
+                 falling back to the per-architecture default",
+                value
+            );
+            None
+        }
+    })
+}
+
+/// Whether to compile for CU (wavefront) mode rather than WGP mode.
+///
+/// Note the polarity, which is easy to get backwards: in AMD LLVM the feature is
+/// `FeatureCuMode` ("Enable CU wavefront execution mode",
+/// `AMDGPU.td`), and the assembler writes `ProgInfo.WgpMode =
+/// STM.isCuModeEnabled() ? 0 : 1` (`AMDGPUAsmPrinter.cpp`). So `+cumode` means
+/// WGP mode is *off*, i.e. CU mode -- `true` here really is CU mode.
+///
+/// The default is WGP mode for RDNA (gfx10/gfx11/gfx12) and CU mode for
+/// everything else, which is what the hardware supports: WGP mode only exists on
+/// RDNA, and gfx9/CDNA have a single CU per work group processor.
 pub fn is_cumode(gcn_arch: &str) -> bool {
-    match std::env::var("ZLUDA_CUMODE").ok().as_deref() {
-        Some("1" | "true" | "TRUE" | "cu" | "CU") => true,
-        Some("0" | "false" | "FALSE" | "wgp" | "WGP") => false,
-        _ => !(gcn_arch.starts_with("gfx10") || gcn_arch.starts_with("gfx11") || gcn_arch.starts_with("gfx12")),
+    match cumode_override() {
+        Some(value) => value,
+        None => {
+            !(gcn_arch.starts_with("gfx10")
+                || gcn_arch.starts_with("gfx11")
+                || gcn_arch.starts_with("gfx12"))
+        }
     }
+}
+
+/// How many parts to cut a module into before generating code, from
+/// `ZLUDA_CODEGEN_PARTS`.
+///
+/// One by default. Splitting changes the code that comes out -- the optimiser
+/// sees less of the module at a time -- and it was briefly made to default to the
+/// host's core count, which had three problems: the output then depended on a
+/// property of the machine rather than of the input (so a shared cache could
+/// serve one host's split to another), a 32-core host started 32 threads, 32
+/// `LLVMContext`s and 32 `TargetMachine`s per module load, and the whole thing
+/// was on for everyone without the measurement that the commit which introduced
+/// it said it needed first. `ZLUDA_CODEGEN_PARTS=auto` asks for the core count
+/// explicitly.
+pub fn codegen_parts() -> u32 {
+    /// A split is worth something only if code generation dominates, and each
+    /// part costs a context, a target machine and a thread. Above a few dozen
+    /// the oversubscription is the larger effect, and an unvalidated value out
+    /// of the environment must not be able to ask for a million part files.
+    const MAX_PARTS: u32 = 32;
+
+    static PARTS: OnceLock<u32> = OnceLock::new();
+    *PARTS.get_or_init(|| {
+        let cores = || {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1)
+        };
+        let requested = match std::env::var("ZLUDA_CODEGEN_PARTS") {
+            Ok(text) if text.eq_ignore_ascii_case("auto") => cores(),
+            Ok(text) => match text.trim().parse::<u32>() {
+                Ok(parts) => parts,
+                Err(_) => {
+                    eprintln!(
+                        "[zluda] ZLUDA_CODEGEN_PARTS={:?} is not a number or \"auto\"; \
+                         not splitting (1 part)",
+                        text
+                    );
+                    return 1;
+                }
+            },
+            Err(_) => 1,
+        };
+        let parts = requested.clamp(1, MAX_PARTS);
+        if parts != requested {
+            eprintln!(
+                "[zluda] ZLUDA_CODEGEN_PARTS={} clamped to {}",
+                requested, parts
+            );
+        }
+        parts
+    })
 }
 
 fn make_target_machine(gcn_arch: &str) -> Result<TargetMachine, String> {
@@ -133,25 +242,23 @@ fn run_optimizer(module: &Module, target_machine: &TargetMachine) -> Result<(), 
         )
     };
     if !error.is_null() {
+        // `LLVMGetErrorMessage` hands back a heap string that only
+        // `LLVMDisposeMessage` releases, and `Message::new` is the *non-owning*
+        // constructor, so letting a `Message` go out of scope here does not free
+        // it (the `Drop` that disposes is on the owning type in `utils.rs`).
+        // Formatting into a `String` and disposing explicitly is what keeps this
+        // from leaking one LLVM allocation per failed optimisation.
         let err_msg = unsafe { llvm_sys::error::LLVMGetErrorMessage(error) };
-        let message = Message::new(unsafe { CStr::from_ptr(err_msg) });
-        return Err(message.to_str().to_string());
+        if err_msg.is_null() {
+            return Err("the LLVM optimiser failed with no message".to_string());
+        }
+        let text = unsafe { CStr::from_ptr(err_msg) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { llvm_sys::core::LLVMDisposeMessage(err_msg) };
+        return Err(text);
     }
     Ok(())
-}
-
-// How many parts to cut the module into before generating code, from
-// ZLUDA_CODEGEN_PARTS. Defaults to available_parallelism to accelerate compilation.
-fn codegen_parts() -> u32 {
-    match std::env::var("ZLUDA_CODEGEN_PARTS").ok().as_deref() {
-        Some("auto") => std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(1),
-        Some(text) => text.parse().unwrap_or(1),
-        None => std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(1),
-    }
 }
 
 // Cuts an already optimised module up and generates code for each part on its
@@ -301,13 +408,41 @@ pub fn compile(
         vec![object]
     };
 
-    // Any of the objects serves as the model for the metadata sections below:
-    // all that is read from it is the ELF header, which they share.
-    let object_file = object_files[0].clone();
+    // The split path never runs the per-kernel dumps above, so say so rather than
+    // letting a debugging aid disappear without explanation just because the
+    // machine has more than one core.
+    if parts > 1 && compiler_hook.is_some() {
+        eprintln!(
+            "[zluda] code generation was split into {} parts, so opt.ll and asm are not \
+             written; set ZLUDA_CODEGEN_PARTS=1 to get them",
+            object_files.len()
+        );
+    }
+
+    // The first object is used as the model for the metadata sections below, and
+    // `kernel_metadata::write_object` copies its whole ELF header rather than just
+    // reading the fields it needs, so this is borrowed rather than cloned: the
+    // objects can be tens of megabytes each.
+    let object_file = &object_files[0];
 
     if let Some(hook) = compiler_hook {
         // Run compiler hook for object file
-        hook(&object_file, String::from("o"));
+        hook(object_file, String::from("o"));
+    }
+
+    // The 32-bit metadata section describes every kernel in the *module* --
+    // `convert_32bit_to_64bit` builds its argument map from all of them -- but
+    // with the module split there is no single object that carries that whole
+    // description, and each part's AMDGPU metadata note describes only its own
+    // kernels. Rather than archive a module-wide map against partition 0 and
+    // serve a view that silently lacks the kernels living in the other parts,
+    // refuse the combination.
+    if metadata32.is_some() && object_files.len() > 1 {
+        return Err(format!(
+            "this module needs the 32-bit metadata section, which describes every kernel at \
+             once, but code generation was split into {} objects; set ZLUDA_CODEGEN_PARTS=1",
+            object_files.len()
+        ));
     }
 
     // One file per object: with the module split for parallel code generation
@@ -330,13 +465,13 @@ pub fn compile(
         .into_temp_path();
 
     metadata
-        .write_object(&object_file, section_path.as_file_mut())
+        .write_object(object_file, section_path.as_file_mut())
         .map_err(|e| format!("Failed to write metadata section: {}", e))?;
     let section32_path = if let Some(metadata32) = metadata32 {
         let mut section32_path = NamedTempFile::with_prefix("zluda32_section")
             .map_err(|e| format!("Failed to create temporary file: {}", e))?;
         metadata32
-            .write_object(&object_file, section32_path.as_file_mut())
+            .write_object(object_file, section32_path.as_file_mut())
             .map_err(|e| format!("Failed to write 32-bit metadata section: {}", e))?;
         Some(section32_path)
     } else {
