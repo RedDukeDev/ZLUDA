@@ -1,7 +1,7 @@
 [submodule "ext/llvm-project"]
 	path = ext/llvm-project
-	url = https://github.com/RedDukeDev/llvm-project.git
-	branch = main
+	url = https://github.com/big2cater/llvm-project.git
+	branch = zluda-rdna4-wmma
 	shallow = true
 [submodule "ext/HiGHS"]
 	path = ext/HiGHS
