@@ -302,12 +302,14 @@ fn compare_ptx(
     actual_ptx_out: &str,
     expected_ptx_out: &str,
 ) {
-    if actual_ptx_out != expected_ptx_out {
+    let actual_ptx_out_norm = actual_ptx_out.replace("\r\n", "\n");
+    let expected_ptx_out_norm = expected_ptx_out.replace("\r\n", "\n");
+    if actual_ptx_out_norm != expected_ptx_out_norm {
         maybe_save_output(name, pass_name, ptx_in, actual_ptx_out);
-        let comparison = pretty_assertions::StrComparison::new(expected_ptx_out, actual_ptx_out);
+        let comparison = pretty_assertions::StrComparison::new(&expected_ptx_out_norm, &actual_ptx_out_norm);
         panic!("assertion failed: `(left == right)`\n\n{}", comparison);
     }
-    if actual_ptx_out == "" {
+    if actual_ptx_out_norm == "" {
         maybe_save_output(name, pass_name, ptx_in, actual_ptx_out);
         panic!("missing expected output");
     }

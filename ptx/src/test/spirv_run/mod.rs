@@ -1439,46 +1439,51 @@ fn test_cuda_assert<
     output: &[Output],
     block_dim_x: u32,
 ) -> Result<(), Box<dyn error::Error>> {
+    let cuda = match &*CUDA {
+        Ok(cuda) => cuda,
+        Err(_) => return Ok(()),
+    };
     let name = CString::new(name)?;
-    let result = run_cuda(name.as_c_str(), ptx_text, input, output, block_dim_x);
+    let result = run_cuda(cuda, name.as_c_str(), ptx_text, input, output, block_dim_x);
     assert_eq!(result.as_slice(), output);
     Ok(())
 }
 
 fn run_cuda<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + Default>(
+    cuda: &DynamicCuda,
     name: &CStr,
     ptx_module: &str,
     input: Option<&[Input]>,
     output: &[Output],
     block_dim_x: u32,
 ) -> Vec<Output> {
-    unsafe { CUDA.cuInit(0) }.unwrap().unwrap();
+    unsafe { cuda.cuInit(0) }.unwrap().unwrap();
     let ptx_module = CString::new(ptx_module).unwrap();
     let mut result = vec![0u8.into(); output.len()];
     {
         let mut ctx = unsafe { mem::zeroed() };
-        unsafe { CUDA.cuCtxCreate_v2(&mut ctx, 0, 0) }
+        unsafe { cuda.cuCtxCreate_v2(&mut ctx, 0, 0) }
             .unwrap()
             .unwrap();
         let mut module = unsafe { mem::zeroed() };
-        unsafe { CUDA.cuModuleLoadData(&mut module, ptx_module.as_ptr() as _) }
+        unsafe { cuda.cuModuleLoadData(&mut module, ptx_module.as_ptr() as _) }
             .unwrap()
             .unwrap();
         let mut kernel = unsafe { mem::zeroed() };
-        unsafe { CUDA.cuModuleGetFunction(&mut kernel, module, name.as_ptr()) }
+        unsafe { cuda.cuModuleGetFunction(&mut kernel, module, name.as_ptr()) }
             .unwrap()
             .unwrap();
         let mut out_b = unsafe { mem::zeroed() };
-        unsafe { CUDA.cuMemAlloc_v2(&mut out_b, output.len() * mem::size_of::<Output>()) }
+        unsafe { cuda.cuMemAlloc_v2(&mut out_b, output.len() * mem::size_of::<Output>()) }
             .unwrap()
             .unwrap();
         let mut inp_b = unsafe { mem::zeroed() };
         if let Some(input) = input {
-            unsafe { CUDA.cuMemAlloc_v2(&mut inp_b, input.len() * mem::size_of::<Input>()) }
+            unsafe { cuda.cuMemAlloc_v2(&mut inp_b, input.len() * mem::size_of::<Input>()) }
                 .unwrap()
                 .unwrap();
             unsafe {
-                CUDA.cuMemcpyHtoD_v2(
+                cuda.cuMemcpyHtoD_v2(
                     inp_b,
                     input.as_ptr() as _,
                     input.len() * mem::size_of::<Input>(),
@@ -1487,7 +1492,7 @@ fn run_cuda<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + De
             .unwrap()
             .unwrap();
         }
-        unsafe { CUDA.cuMemsetD8_v2(out_b, 0, output.len() * mem::size_of::<Output>()) }
+        unsafe { cuda.cuMemsetD8_v2(out_b, 0, output.len() * mem::size_of::<Output>()) }
             .unwrap()
             .unwrap();
         let mut args = if input.is_some() {
@@ -1496,7 +1501,7 @@ fn run_cuda<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + De
             [&out_b, &out_b]
         };
         unsafe {
-            CUDA.cuLaunchKernel(
+            cuda.cuLaunchKernel(
                 kernel,
                 1,
                 1,
@@ -1513,7 +1518,7 @@ fn run_cuda<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + De
         .unwrap()
         .unwrap();
         unsafe {
-            CUDA.cuMemcpyDtoH_v2(
+            cuda.cuMemcpyDtoH_v2(
                 result.as_mut_ptr() as _,
                 out_b,
                 output.len() * mem::size_of::<Output>(),
@@ -1521,13 +1526,13 @@ fn run_cuda<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + De
         }
         .unwrap()
         .unwrap();
-        unsafe { CUDA.cuStreamSynchronize(CUstream(ptr::null_mut())) }
+        unsafe { cuda.cuStreamSynchronize(CUstream(ptr::null_mut())) }
             .unwrap()
             .unwrap();
-        unsafe { CUDA.cuMemFree_v2(inp_b) }.unwrap().unwrap();
-        unsafe { CUDA.cuMemFree_v2(out_b) }.unwrap().unwrap();
-        unsafe { CUDA.cuModuleUnload(module) }.unwrap().unwrap();
-        unsafe { CUDA.cuCtxDestroy_v2(ctx) }.unwrap().unwrap();
+        unsafe { cuda.cuMemFree_v2(inp_b) }.unwrap().unwrap();
+        unsafe { cuda.cuMemFree_v2(out_b) }.unwrap().unwrap();
+        unsafe { cuda.cuModuleUnload(module) }.unwrap().unwrap();
+        unsafe { cuda.cuCtxDestroy_v2(ctx) }.unwrap().unwrap();
     }
     result
 }
@@ -1564,8 +1569,8 @@ macro_rules! dynamic_fns {
 
 cuda_macros::cuda_function_declarations!(dynamic_fns);
 
-static CUDA: std::sync::LazyLock<DynamicCuda> =
-    std::sync::LazyLock::new(|| DynamicCuda::new().unwrap());
+static CUDA: std::sync::LazyLock<Result<DynamicCuda, libloading::Error>> =
+    std::sync::LazyLock::new(|| DynamicCuda::new());
 
 fn run_hip<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + Default>(
     name: &CStr,
