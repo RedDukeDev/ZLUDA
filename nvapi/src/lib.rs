@@ -666,11 +666,20 @@ unsafe fn NvAPI_GPU_CudaEnumComputeCapableGpus_v2(
 // One GPU is reported, using the same fake handle value 1 that
 // NvAPI_GPU_CudaEnumComputeCapableGpus already hands out.
 
-// Reads the adapter LUID from the CUDA driver already loaded in this process.
-// GetModuleHandleW rather than LoadLibraryW: if nvcuda is not there yet then
-// nothing has asked us about GPUs for a reason that matters.
+// Reads the adapter LUID from the CUDA driver.
+//
+// GetModuleHandleW first, because if nvcuda is already in the process that is
+// the cheapest way to find it and it cannot have side effects. LoadLibraryW as a
+// fallback, because "already loaded" is not something this function can rely on:
+// it is called when the snippet asks about a GPU, and whether the snippet has
+// loaded its CUDA driver by then is its business, not ours. Leaving the DLL
+// loaded on purpose -- the process is going to need it, and unloading a driver
+// the snippet may hold function pointers into would be worse than keeping it.
 unsafe fn cuda_device_luid(luid: &mut [i8; 8], node_mask: &mut u32) -> bool {
-    let nvcuda = winapi_get_module(b"nvcuda.dll\0");
+    let mut nvcuda = winapi_get_module(b"nvcuda.dll\0");
+    if nvcuda.is_null() {
+        nvcuda = LoadLibraryA(c"nvcuda.dll".as_ptr().cast());
+    }
     if nvcuda.is_null() {
         return false;
     }
@@ -691,6 +700,7 @@ unsafe fn cuda_device_luid(luid: &mut [i8; 8], node_mask: &mut u32) -> bool {
 extern "system" {
     fn GetModuleHandleA(name: *const u8) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn LoadLibraryA(name: *const u8) -> *mut c_void;
 }
 
 unsafe fn winapi_get_module(name: &[u8]) -> *mut c_void {
@@ -745,7 +755,15 @@ unsafe extern "C" fn NvAPI_GPU_GetLogicalGpuInfo(
     );
     // The caller matches this LUID against the one cuDeviceGetLuid reports, so
     // the two have to agree exactly. Rather than duplicate the derivation, ask
-    // the CUDA driver that is already in the process.
+    // the CUDA driver what it is.
+    //
+    // If it cannot be read the field is *cleared*, not left alone. It used to be
+    // skipped, which meant the snippet compared its own uninitialised bytes --
+    // or whatever the caller had put there -- against the driver's real LUID,
+    // found no match, concluded there were no GPUs, and fell back to GK100. That
+    // is the same dead end this whole file exists to avoid, reached silently,
+    // because the function still answered success. Written out, the failure is
+    // at least the same one every run, and it says so once.
     if !data.pOSAdapterId.is_null() {
         let mut luid = [0i8; 8];
         let mut node_mask: u32 = 0;
@@ -755,6 +773,16 @@ unsafe extern "C" fn NvAPI_GPU_GetLogicalGpuInfo(
                 data.pOSAdapterId.cast::<u8>(),
                 8,
             );
+        } else {
+            std::ptr::write_bytes(data.pOSAdapterId.cast::<u8>(), 0, 8);
+            static COMPLAINED: std::sync::Once = std::sync::Once::new();
+            COMPLAINED.call_once(|| {
+                eprintln!(
+                    "[zluda] nvapi: cuDeviceGetLuid is not available, so the adapter LUID \
+                     reported to the caller is zero. If the network reports no GPU or refuses \
+                     to run, this is why."
+                );
+            });
         }
     }
     data.physicalGpuCount = 1;
