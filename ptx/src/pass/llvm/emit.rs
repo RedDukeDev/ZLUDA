@@ -762,7 +762,7 @@ impl<'a> MethodEmitContext<'a> {
             unsafe {
                 LLVMIntTypeInContext(
                     self.context,
-                    data.typ.layout().ok_or_else(error_unreachable)?.size() as u32 * 8,
+                    data.typ.layout().ok_or_unreachable()?.size() as u32 * 8,
                 )
             }
         } else {
@@ -774,7 +774,7 @@ impl<'a> MethodEmitContext<'a> {
         unsafe {
             LLVMSetAlignment(
                 load,
-                data.typ.layout().ok_or_else(error_unreachable)?.align() as u32,
+                data.typ.layout().ok_or_unreachable()?.align() as u32,
             )
         };
         if needs_cast {
@@ -886,7 +886,7 @@ impl<'a> MethodEmitContext<'a> {
         match (from_type, to_type) {
             (ast::Type::Scalar(from_type), ast::Type::Scalar(to_type_scalar)) => {
                 let from_layout = from_type.layout();
-                let to_layout = to_type.layout().ok_or_else(error_unreachable)?;
+                let to_layout = to_type.layout().ok_or_unreachable()?;
                 if from_layout.size() == to_layout.size() {
                     let dst_type = get_type(self.context, &to_type)?;
                     if from_type.kind() != ast::ScalarKind::Float
@@ -1231,7 +1231,7 @@ impl<'a> MethodEmitContext<'a> {
                     value,
                     LLVMIntTypeInContext(
                         self.context,
-                        data.typ.layout().ok_or_else(error_unreachable)?.size() as u32 * 8,
+                        data.typ.layout().ok_or_unreachable()?.size() as u32 * 8,
                     ),
                     LLVM_UNNAMED.as_ptr(),
                 )
@@ -1242,7 +1242,7 @@ impl<'a> MethodEmitContext<'a> {
         unsafe {
             LLVMSetAlignment(
                 store,
-                data.typ.layout().ok_or_else(error_unreachable)?.align() as u32,
+                data.typ.layout().ok_or_unreachable()?.align() as u32,
             );
         }
         Ok(())
@@ -1488,7 +1488,7 @@ impl<'a> MethodEmitContext<'a> {
                 unsafe {
                     LLVMSetAlignment(
                         load,
-                        type_.layout().ok_or_else(error_unreachable)?.align() as u32,
+                        type_.layout().ok_or_unreachable()?.align() as u32,
                     );
                 }
                 Ok((load, type_))
@@ -2623,7 +2623,7 @@ impl<'a> MethodEmitContext<'a> {
             None => {
                 self.resolver.register(
                     arguments.dst,
-                    dst_int_rounded.ok_or_else(error_unreachable)?,
+                    dst_int_rounded.ok_or_unreachable()?,
                 );
                 return Ok(());
             }

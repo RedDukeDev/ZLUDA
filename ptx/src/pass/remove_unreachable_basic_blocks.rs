@@ -59,7 +59,7 @@ pub(crate) fn run(
                         Statement::Label(label) => {
                             visited = bfs
                                 .discovered
-                                .is_visited(cfg.nodes.get(label).ok_or_else(error_unreachable)?);
+                                .is_visited(cfg.nodes.get(label).ok_or_unreachable()?);
                         }
                         _ => {}
                     }

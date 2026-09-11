@@ -115,7 +115,7 @@ fn convert_from_multiple_returns_to_single_return(
             data: ast::RetData { uniform: false },
         }));
         for ret_index in return_statements {
-            let statement = result.get_mut(ret_index).ok_or_else(error_unreachable)?;
+            let statement = result.get_mut(ret_index).ok_or_unreachable()?;
             *statement = Statement::Instruction(ast::Instruction::Bra {
                 arguments: ast::BraArgs { src: ret_bb },
             });

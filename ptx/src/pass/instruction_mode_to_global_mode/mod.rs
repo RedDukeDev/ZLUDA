@@ -7,6 +7,7 @@ use super::SpirvWord;
 use super::Statement;
 use super::TranslateError;
 use crate::pass::error_unreachable;
+use crate::pass::OptionExt;
 use fixedbitset::FixedBitSet;
 use highs::HighsStatus;
 use petgraph::graph::NodeIndex;
@@ -369,7 +370,7 @@ impl ControlFlowGraph {
             let connecting_bb = match self.functions_rets.get(fn_) {
                 Some(return_bb) => *return_bb,
                 // function is just a declaration
-                None => *self.basic_blocks.get(fn_).ok_or_else(error_unreachable)?,
+                None => *self.basic_blocks.get(fn_).ok_or_unreachable()?,
             };
             for follow_on_label in follow_on_labels {
                 self.graph.add_edge(connecting_bb, *follow_on_label, ());
@@ -411,7 +412,7 @@ impl ResolvedControlFlowGraph {
                         None => return Err(error_unreachable()),
                         Some(ComputedValue::Conflict) => Resolved::Conflict,
                         Some(ComputedValue::Value(value, _)) => {
-                            Resolved::Value(value.ok_or_else(error_unreachable)?)
+                            Resolved::Value(value.ok_or_unreachable()?)
                         }
                     },
                     PropagationState::Propagated(computed_value) => match computed_value {
@@ -982,19 +983,19 @@ fn apply_global_mode_controls(
                     let initial_mode = global_modes
                         .basic_blocks
                         .get(&name)
-                        .ok_or_else(error_unreachable)?;
+                        .ok_or_unreachable()?;
                     let denormal_mode = initial_mode.denormal.twin_mode;
                     let rounding_mode = initial_mode.rounding.twin_mode;
 
                     if let Some(kernel_attrs) = &mut method.kernel_attributes {
                         kernel_attrs.flush_to_zero_f32 =
-                            denormal_mode.f32.ok_or_else(error_unreachable)?.to_ftz();
+                            denormal_mode.f32.ok_or_else(|| error_unreachable())?.to_ftz();
                         kernel_attrs.flush_to_zero_f16f64 =
-                            denormal_mode.f16f64.ok_or_else(error_unreachable)?.to_ftz();
+                            denormal_mode.f16f64.ok_or_else(|| error_unreachable())?.to_ftz();
                         kernel_attrs.rounding_mode_f32 =
-                            rounding_mode.f32.ok_or_else(error_unreachable)?.to_ast();
+                            rounding_mode.f32.ok_or_else(|| error_unreachable())?.to_ast();
                         kernel_attrs.rounding_mode_f16f64 =
-                            rounding_mode.f16f64.ok_or_else(error_unreachable)?.to_ast();
+                            rounding_mode.f16f64.ok_or_else(|| error_unreachable())?.to_ast();
                     }
 
                     (method, initial_mode)
@@ -1058,7 +1059,7 @@ fn apply_global_mode_controls(
                 }
                 result.push(statement);
                 if let Some(call_target) = call_target {
-                    let mut post_call_bra = old_body.next().ok_or_else(error_unreachable)?;
+                    let mut post_call_bra = old_body.next().ok_or_unreachable()?;
                     if let Statement::Instruction(ast::Instruction::Bra {
                         arguments:
                             ast::BraArgs {
@@ -1069,7 +1070,7 @@ fn apply_global_mode_controls(
                         let node_exit_mode = global_modes
                             .functions_exit_modes
                             .get(&call_target)
-                            .ok_or_else(error_unreachable)?;
+                            .ok_or_unreachable()?;
                         redirect_jump_impl(
                             &bb_state.global_modes,
                             node_exit_mode,
@@ -1094,7 +1095,7 @@ fn check_function_prelude(
     let fn_mode_state = global_modes
         .basic_blocks
         .get(&method.name)
-        .ok_or_else(error_unreachable)?;
+        .ok_or_unreachable()?;
     // A function should never have a prelude. Preludes happen only if there
     // is an edge in the control flow graph that requires a mode change.
     // Since functions never have a mode setting instructions that means they
@@ -1160,7 +1161,7 @@ impl<'a> BasicBlockControlState<'a> {
             .global_modes
             .basic_blocks
             .get(&basic_block)
-            .ok_or_else(error_unreachable)?;
+            .ok_or_unreachable()?;
 
         let denormal_f32 = RegisterState::new(bb_state.denormal.twin_mode.f32);
         let denormal_f16f64 = RegisterState::new(bb_state.denormal.twin_mode.f16f64);
@@ -1315,7 +1316,7 @@ fn redirect_jump_impl(
     let target = global_modes
         .basic_blocks
         .get(jump_target)
-        .ok_or_else(error_unreachable)?;
+        .ok_or_unreachable()?;
     let jump_to_denormal_prelude = current_mode
         .denormal_f32
         .mode_change(target.denormal.twin_mode.f32.map(DenormalMode::to_ftz))
@@ -1330,13 +1331,13 @@ fn redirect_jump_impl(
             .mode_change(target.rounding.twin_mode.f16f64.map(RoundingMode::to_ast));
     match (jump_to_denormal_prelude, jump_to_rounding_prelude) {
         (true, false) => {
-            *jump_target = target.denormal.prologue.ok_or_else(error_unreachable)?;
+            *jump_target = target.denormal.prologue.ok_or_unreachable()?;
         }
         (false, true) => {
-            *jump_target = target.rounding.prologue.ok_or_else(error_unreachable)?;
+            *jump_target = target.rounding.prologue.ok_or_unreachable()?;
         }
         (true, true) => {
-            *jump_target = target.dual_prologue.ok_or_else(error_unreachable)?;
+            *jump_target = target.dual_prologue.ok_or_unreachable()?;
         }
         (false, false) => {}
     }
@@ -1594,7 +1595,7 @@ impl<'a> BasicBlockState<'a> {
         fn_call: SpirvWord,
         after_call_label: SpirvWord,
     ) -> Result<(), TranslateError> {
-        self.end(&[fn_call]).ok_or_else(error_unreachable)?;
+        self.end(&[fn_call]).ok_or_unreachable()?;
         let after_call_label = self.cfg.get_or_add_basic_block(after_call_label);
         let call_returns = self
             .cfg
@@ -1606,7 +1607,7 @@ impl<'a> BasicBlockState<'a> {
     }
 
     fn record_ret(&mut self, fn_name: SpirvWord) -> Result<(), TranslateError> {
-        let node_index = self.node_index.ok_or_else(error_unreachable)?;
+        let node_index = self.node_index.ok_or_unreachable()?;
         let previous_function_ret = self.cfg.functions_rets.insert(fn_name, node_index);
         // This pass relies on there being only a single `ret;` in a function
         if previous_function_ret.is_some() {
@@ -1794,7 +1795,7 @@ impl<T: Copy> PropagationState<T> {
     fn get_entry(&mut self) -> Result<(&mut ComputedValue<T>, bool), TranslateError> {
         Ok(match self {
             PropagationState::Fixed { entry, .. } => {
-                (entry.as_mut().ok_or_else(error_unreachable)?, false)
+                (entry.as_mut().ok_or_unreachable()?, false)
             }
             PropagationState::Propagated(entry) => (entry, true),
         })
@@ -1907,7 +1908,7 @@ impl<T: PartialEq + Eq + Copy + VariantArray + Into<usize> + Default> PartialMod
                 let bb_id = cfg
                     .graph
                     .node_weight(NodeIndex::new(node_index))
-                    .ok_or_else(error_unreachable)?
+                    .ok_or_unreachable()?
                     .label;
                 bb_must_insert_mode.insert(bb_id);
             }
@@ -1919,11 +1920,11 @@ impl<T: PartialEq + Eq + Copy + VariantArray + Into<usize> + Default> PartialMod
                 if kernels.is_empty() {
                     continue;
                 }
-                let value = value.ok_or_else(error_unreachable)?;
+                let value = value.ok_or_unreachable()?;
                 let node_id = cfg
                     .graph
                     .node_weight(NodeIndex::new(node_index))
-                    .ok_or_else(error_unreachable)?
+                    .ok_or_unreachable()?
                     .label;
                 let (_, slow_kernels_source) = slow_mode_from_kernels
                     .entry(node_id)

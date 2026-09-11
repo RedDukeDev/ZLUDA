@@ -12,7 +12,7 @@
 use crate::{
     pass::{
         error_todo, error_unreachable, Directive2, Function, Function32,
-        GlobalStringIdentResolver2, SpirvWord, Statement,
+        GlobalStringIdentResolver2, OptionExt, SpirvWord, Statement,
     },
     TranslateError,
 };
@@ -113,11 +113,11 @@ fn get_global_details<'input>(
     let entry = resolver
         .ident_map
         .get(&name)
-        .ok_or_else(error_unreachable)?;
+        .ok_or_unreachable()?;
     let text_name = entry
         .name
         .as_ref()
-        .ok_or_else(error_unreachable)?
+        .ok_or_unreachable()?
         .to_string();
     let align = align.unwrap_or(1);
     let initializer = array_init
@@ -185,7 +185,7 @@ fn run_method<'input>(
                     .as_ref()
                     .map(|x| x.as_ref())
             })
-            .ok_or_else(error_unreachable)?
+            .ok_or_unreachable()?
             .to_string();
         let argument_sizes = method
             .input_arguments

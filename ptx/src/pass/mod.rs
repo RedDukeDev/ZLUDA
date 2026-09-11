@@ -264,7 +264,17 @@ fn error_unreachable() -> TranslateError {
     TranslateError::Unreachable
 }
 
-#[allow(dead_code)]
+/// `Option::ok_or_else(error_unreachable)`, but with a location that means
+/// something.
+///
+/// `error_unreachable` reports `Location::caller()`, and `#[track_caller]` is
+/// forwarded through a chain of `#[track_caller]` functions but *not* through a
+/// closure: passing the function item straight to `ok_or_else` makes the call
+/// inside `core::ops::function.rs` the caller, so every such site reported the
+/// same useless `library/core/src/ops/function.rs:250` and the location that is
+/// supposed to make a failed translation diagnosable diagnosed nothing. Going
+/// through this method keeps the real call site, because the location is
+/// forwarded from the caller to `error_unreachable` directly.
 pub(crate) trait OptionExt<T> {
     fn ok_or_unreachable(self) -> Result<T, TranslateError>;
 }
