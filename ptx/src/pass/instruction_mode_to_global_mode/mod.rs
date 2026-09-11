@@ -519,13 +519,13 @@ impl ResolvedControlFlowGraph {
     }
 }
 
-fn resolve_fast<T: Copy + VariantArray + Into<usize>>(
+fn resolve_fast<T: Copy + VariantArray + Into<usize> + Default>(
     modes: &MandatoryModeInsertions<T>,
     value: &Option<T>,
     kernels: &FixedBitSet,
 ) -> Result<Resolved<T>, TranslateError> {
     Ok(if kernels.is_empty() {
-        Resolved::Value(value.ok_or_else(error_unreachable)?)
+        Resolved::Value(value.unwrap_or_default())
     } else {
         match value {
             None => from_kernel_modes_overlap(kernels, modes)?,

@@ -249,8 +249,9 @@ impl PtxSpecialRegister {
 }
 
 #[cfg(debug_assertions)]
+#[track_caller]
 fn error_unreachable() -> TranslateError {
-    unreachable!()
+    panic!("internal error: entered unreachable code at {}", std::panic::Location::caller());
 }
 
 #[cfg(not(debug_assertions))]
@@ -261,6 +262,21 @@ fn error_unreachable() -> TranslateError {
     // module that fails to translate diagnosable.
     eprintln!("[zluda] unreachable at {}", std::panic::Location::caller());
     TranslateError::Unreachable
+}
+
+#[allow(dead_code)]
+pub(crate) trait OptionExt<T> {
+    fn ok_or_unreachable(self) -> Result<T, TranslateError>;
+}
+
+impl<T> OptionExt<T> for Option<T> {
+    #[track_caller]
+    fn ok_or_unreachable(self) -> Result<T, TranslateError> {
+        match self {
+            Some(v) => Ok(v),
+            None => Err(error_unreachable()),
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
