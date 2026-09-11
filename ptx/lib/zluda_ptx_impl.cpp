@@ -84,9 +84,14 @@ then cd to the directory with this file and run this simple command:
 #define SHARED_SPACE __attribute__((address_space(3)))
 #define CONSTANT_SPACE __attribute__((address_space(4)))
 
+extern "C" __device__ void __assert_fail(const char *, const char *, unsigned int, const char *);
+
 typedef unsigned int v2u32 __attribute__((ext_vector_type(2)));
 typedef unsigned short v2u16 __attribute__((ext_vector_type(2)));
 typedef unsigned char v4u8 __attribute__((ext_vector_type(4)));
+typedef unsigned char v2u8 __attribute__((ext_vector_type(2)));
+typedef unsigned short v4u16 __attribute__((ext_vector_type(4)));
+typedef unsigned int v4u32 __attribute__((ext_vector_type(4)));
 typedef int s32;
 typedef int v1s32 __attribute__((ext_vector_type(1)));
 typedef int v2s32 __attribute__((ext_vector_type(2)));
@@ -1631,13 +1636,37 @@ extern "C"
                      std::bit_cast<float>(c), std::bit_cast<float>(d)};
     }
 
+    void FUNC(sustobj_b_2d_b8)(uint64_t surfobj, v2s32 coord, uint8_t data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data, 0, 0, 0));
+    }
+
+    void FUNC(sustobj_b_2d_b16)(uint64_t surfobj, v2s32 coord, uint16_t data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data, 0, 0, 0));
+    }
+
     void FUNC(sustobj_b_2d_b32)(uint64_t surfobj, v2s32 coord, uint32_t data)
     {
         coord.x = byte_x_to_sample_x(surfobj, coord.x);
         store_2D(surfobj, coord, raw_lanes(data, 0, 0, 0));
     }
 
+    void FUNC(sustobj_b_2d_v2_b8)(uint64_t surfobj, v2s32 coord, v2u8 data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data.x, data.y, 0, 0));
+    }
+
     void FUNC(sustobj_b_2d_v2_b16)(uint64_t surfobj, v2s32 coord, v2u16 data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data.x, data.y, 0, 0));
+    }
+
+    void FUNC(sustobj_b_2d_v2_b32)(uint64_t surfobj, v2s32 coord, v2u32 data)
     {
         coord.x = byte_x_to_sample_x(surfobj, coord.x);
         store_2D(surfobj, coord, raw_lanes(data.x, data.y, 0, 0));
@@ -1649,12 +1678,90 @@ extern "C"
         store_2D(surfobj, coord, raw_lanes(data.x, data.y, data.z, data.w));
     }
 
+    void FUNC(sustobj_b_2d_v4_b16)(uint64_t surfobj, v2s32 coord, v4u16 data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data.x, data.y, data.z, data.w));
+    }
+
+    void FUNC(sustobj_b_2d_v4_b32)(uint64_t surfobj, v2s32 coord, v4u32 data)
+    {
+        coord.x = byte_x_to_sample_x(surfobj, coord.x);
+        store_2D(surfobj, coord, raw_lanes(data.x, data.y, data.z, data.w));
+    }
+
     void FUNC(sustobj_p_2d_b32)(uint64_t surfobj, v2s32 coord, s32 data)
     {
         // A single channel surface still goes through the four channel store; the
         // descriptor decides how many of them actually land.
         v4f32 splat = {std::bit_cast<float>(data), 0.0f, 0.0f, 0.0f};
         store_2D(surfobj, coord, splat);
+    }
+
+    void FUNC(sustobj_p_2d_v2_b32)(uint64_t surfobj, v2s32 coord, v2s32 data)
+    {
+        v4f32 splat = {std::bit_cast<float>(data.x), std::bit_cast<float>(data.y), 0.0f, 0.0f};
+        store_2D(surfobj, coord, splat);
+    }
+
+    void FUNC(sustref_p_2d_b32)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, s32 data)
+    {
+        FUNC_CALL(sustobj_p_2d_b32)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_p_2d_v2_b32)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, v2s32 data)
+    {
+        FUNC_CALL(sustobj_p_2d_v2_b32)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_p_2d_v4_b32)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, v4s32 data)
+    {
+        FUNC_CALL(sustobj_p_2d_v4_b32)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_b8)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, uint8_t data)
+    {
+        FUNC_CALL(sustobj_b_2d_b8)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_b16)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, uint16_t data)
+    {
+        FUNC_CALL(sustobj_b_2d_b16)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_b32)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, uint32_t data)
+    {
+        FUNC_CALL(sustobj_b_2d_b32)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_v2_b8)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, v2u8 data)
+    {
+        FUNC_CALL(sustobj_b_2d_v2_b8)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_v2_b16)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, v2u16 data)
+    {
+        FUNC_CALL(sustobj_b_2d_v2_b16)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_v2_b32)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, v2u32 data)
+    {
+        FUNC_CALL(sustobj_b_2d_v2_b32)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_v4_b8)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, v4u8 data)
+    {
+        FUNC_CALL(sustobj_b_2d_v4_b8)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_v4_b16)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, v4u16 data)
+    {
+        FUNC_CALL(sustobj_b_2d_v4_b16)(uint64_t(surfref->surfaceObject), coord, data);
+    }
+
+    void FUNC(sustref_b_2d_v4_b32)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, v4u32 data)
+    {
+        FUNC_CALL(sustobj_b_2d_v4_b32)(uint64_t(surfref->surfaceObject), coord, data);
     }
     tex_2d(f32, s32);
     tex_2d(s32, f32);
