@@ -52,25 +52,41 @@ impl ModuleCache {
         let mut conn = SqliteConnection::establish(file_path).ok()?;
         // busy_timeout defaults to 0: a second writer gets SQLITE_BUSY at once
         // rather than waiting for the first to finish. WAL still serialises
-        // writers, it just does not make them queue for each other on its own.
-        // insert_module below discards its own error with .ok(), so under that
-        // default a batch of parallel translations -- exactly what precompiling
-        // a whole network at once produces, up to sixteen processes finishing
-        // within moments of each other -- has most of its inserts silently
-        // lost: the module was translated correctly, translating it again is
-        // the only sign anything went wrong, because there is no record it
-        // ever happened. 30 seconds is generous next to how rarely two writes
-        // actually land in the same instant.
+        // writers, it just does not make them queue for each other on its own,
+        // and under that default a batch of parallel translations -- exactly what
+        // precompiling a whole network at once produces, up to sixteen processes
+        // finishing within moments of each other -- had most of its inserts
+        // silently lost: the module was translated correctly and translating it
+        // again was the only sign anything went wrong, because there was no
+        // record it ever happened.
+        //
+        // Five seconds, not thirty. The timeout is *not* what makes writes
+        // durable (see insert_module, which retries and reports), so its only
+        // remaining job is to absorb a brief collision. A long one is not free:
+        // get_module_binary is an UPDATE, so every cache *read* also takes the
+        // write lock, and a reader that waits out a thirty-second timeout before
+        // giving up turns a cheap miss into a thirty-second stall on a path that
+        // runs once per module.
         conn.batch_execute(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 30000;",
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
         )
         .ok()?;
         conn.run_pending_migrations(MIGRATIONS).ok()?;
         Some(Self(conn))
     }
 
+    /// Looks an entry up, refreshing its `last_access`.
+    ///
+    /// Deliberately quieter about contention than `insert_module`: a miss here is
+    /// cheap (it means "translate it"), so waiting a long time for the write lock
+    /// only delays the work that has to happen anyway. A short timeout is set for
+    /// this statement and restored afterwards, so one busy reader cannot pin the
+    /// connection for the full timeout that writers are allowed.
     pub fn get_module_binary(&mut self, key: &ModuleKey) -> Option<Vec<u8>> {
-        diesel::update(modules::dsl::modules)
+        self.0
+            .batch_execute("PRAGMA busy_timeout = 100;")
+            .ok()?;
+        let found = diesel::update(modules::dsl::modules)
             .set(modules::last_access.eq(key.last_access))
             .filter(modules::hash.eq(key.hash.as_str()))
             .filter(modules::compiler_version.eq(&key.compiler_version))
@@ -79,22 +95,58 @@ impl ModuleCache {
             .filter(modules::backend_key.eq(&key.backend_key))
             .returning(modules::binary)
             .get_result(&mut self.0)
-            .ok()
+            .ok();
+        // Restore the write path's longer patience. A failure here only leaves the
+        // shorter timeout in place for the next statement, which is recoverable.
+        let _ = self.0.batch_execute("PRAGMA busy_timeout = 5000;");
+        found
     }
 
-    pub fn insert_module(&mut self, key: &ModuleKey, binary: &[u8]) {
-        diesel::insert_into(modules::dsl::modules)
-            .values(models::AddModule {
-                hash: key.hash.as_str(),
-                compiler_version: &key.compiler_version,
-                zluda_version: key.zluda_version,
-                device: key.device,
-                backend_key: &key.backend_key,
-                last_access: key.last_access,
-                binary,
-            })
-            .execute(&mut self.0)
-            .ok();
+    /// Writes an entry, retrying the two failure modes that are worth retrying.
+    ///
+    /// A busy timeout alone is not enough to make writes durable. SQLite returns
+    /// `SQLITE_BUSY_SNAPSHOT` immediately -- without consulting the busy handler
+    /// at all -- when a write is attempted on a connection whose cached WAL read
+    /// snapshot has gone stale, which is the *common* case here because
+    /// `get_module_binary` reads and writes on the same connection. The fix is
+    /// not a longer wait but a fresh statement: a new statement takes a new
+    /// snapshot. So a busy failure is retried a few times with a short backoff,
+    /// and if it still fails the caller is told rather than left to discover it
+    /// by noticing that the next run translated everything again.
+    pub fn insert_module(
+        &mut self,
+        key: &ModuleKey,
+        binary: &[u8],
+    ) -> Result<(), diesel::result::Error> {
+        const ATTEMPTS: u32 = 5;
+        for attempt in 0..ATTEMPTS {
+            let result = diesel::insert_into(modules::dsl::modules)
+                .values(models::AddModule {
+                    hash: key.hash.as_str(),
+                    compiler_version: &key.compiler_version,
+                    zluda_version: key.zluda_version,
+                    device: key.device,
+                    backend_key: &key.backend_key,
+                    last_access: key.last_access,
+                    binary,
+                })
+                .execute(&mut self.0);
+            match result {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    // The insert already exists is not a failure: another process
+                    // won the race and stored the same translation.
+                    if is_unique_violation(&error) {
+                        return Ok(());
+                    }
+                    if !is_busy(&error) || attempt + 1 == ATTEMPTS {
+                        return Err(error);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1 << attempt));
+                }
+            }
+        }
+        unreachable!("the loop either returns or reports")
     }
 
     // Throw an entry away. Used when what came back cannot be right -- a
@@ -118,6 +170,43 @@ impl ModuleCache {
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_millis() as i64
+    }
+}
+
+/// Whether a failed insert failed because another writer holds the lock.
+///
+/// The message is inspected as well as the kind because the interesting case,
+/// `SQLITE_BUSY_SNAPSHOT`, is not one of diesel's named kinds: it arrives as
+/// `Unknown` carrying SQLite's own "database is locked" text. It is also the case
+/// that matters most here, since it is returned without consulting the busy
+/// handler at all.
+fn is_busy(error: &diesel::result::Error) -> bool {
+    match error {
+        diesel::result::Error::DatabaseError(kind, info) => {
+            matches!(
+                kind,
+                diesel::result::DatabaseErrorKind::SerializationFailure
+            ) || {
+                let message = info.message();
+                message.contains("locked") || message.contains("busy")
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether a failed insert failed because the row is already there. Two processes
+/// translating the same module at once both try to store it, and the second one
+/// losing that race has not gone wrong.
+fn is_unique_violation(error: &diesel::result::Error) -> bool {
+    match error {
+        diesel::result::Error::DatabaseError(kind, info) => {
+            matches!(
+                kind,
+                diesel::result::DatabaseErrorKind::UniqueViolation
+            ) || info.message().contains("UNIQUE constraint failed")
+        }
+        _ => false,
     }
 }
 
@@ -180,7 +269,7 @@ mod tests {
                 last_access: 123,
             },
             &[1, 2, 3, 4, 5],
-        );
+        ).unwrap();
         db.insert_module(
             &super::ModuleKey {
                 hash: ArrayString::from("test_hash2").unwrap(),
@@ -191,7 +280,7 @@ mod tests {
                 last_access: 124,
             },
             &[1, 2, 3],
-        );
+        ).unwrap();
         let mut all_modules = modules.select(Module::as_select()).load(&mut db.0).unwrap();
         all_modules.sort_by_key(|m: &Module| m.id);
         assert_eq!(all_modules.len(), 2);
@@ -219,7 +308,7 @@ mod tests {
                 last_access: 123,
             },
             &[1, 2, 3, 4, 5],
-        );
+        ).unwrap();
         let module_binary = db
             .get_module_binary(&super::ModuleKey {
                 hash: ArrayString::from("test_hash").unwrap(),
@@ -251,7 +340,7 @@ mod tests {
             backend_key: "{}".to_string(),
             last_access: access,
         };
-        db.insert_module(&entry(123), &[1, 2, 3, 4, 5]);
+        db.insert_module(&entry(123), &[1, 2, 3, 4, 5]).unwrap();
         db.remove_module(&entry(124));
         assert!(db.get_module_binary(&entry(125)).is_none());
         let all_modules = modules.select(Module::as_select()).load(&mut db.0).unwrap();
@@ -261,7 +350,7 @@ mod tests {
         let all_globals = globals.select(Global::as_select()).load(&mut db.0).unwrap();
         assert_eq!(all_globals[0].value, 0);
         // And the key is free again, so the next translation can take it.
-        db.insert_module(&entry(126), &[9, 9]);
+        db.insert_module(&entry(126), &[9, 9]).unwrap();
         assert_eq!(db.get_module_binary(&entry(127)).unwrap(), &[9, 9]);
     }
 
@@ -278,7 +367,7 @@ mod tests {
                 last_access: 123,
             },
             &[1, 2, 3, 4, 5],
-        );
+        ).unwrap();
         db.insert_module(
             &super::ModuleKey {
                 hash: ArrayString::from("test_hash").unwrap(),
@@ -289,7 +378,7 @@ mod tests {
                 last_access: 124,
             },
             &[5, 4, 3, 2, 1],
-        );
+        ).unwrap();
         let all_modules = modules.select(Module::as_select()).load(&mut db.0).unwrap();
         assert_eq!(all_modules.len(), 1);
         assert_eq!(all_modules[0].last_access, 123);

@@ -265,10 +265,16 @@ fn get_best_ptx_and_compile(
     let hip_properties = get_hip_properties()?;
     let gcn_arch = get_gcn_arch(&hip_properties)?;
     let cumode = llvm_zluda::is_cumode(gcn_arch);
+    // Read once here and carried in `attributes`, so the value that names the
+    // cache entry is the same value that governs code generation below. Reading
+    // the environment again inside the compiler would let the two disagree if it
+    // changed in between.
+    let codegen_parts = llvm_zluda::codegen_parts();
     let attributes = ExtraCacheAttributes {
         clock_rate: hip_properties.clockRate as u32,
         is_debug: cfg!(debug_assertions),
         cumode,
+        codegen_parts,
     };
     let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
         (Some(text), Some(p)) => (|| {
@@ -315,6 +321,14 @@ struct ExtraCacheAttributes {
     is_debug: bool,
     clock_rate: u32,
     cumode: bool,
+    /// How many parts the module is cut into before code generation.
+    ///
+    /// This belongs in the key because it changes the output: splitting narrows
+    /// what the optimiser can see, so a module compiled as one object and the
+    /// same module compiled as N are not the same code. The count depends on the
+    /// host's CPU count, so without it a cache written on one machine answers for
+    /// another that would have compiled something different.
+    codegen_parts: u32,
 }
 
 fn get_hip_properties<'a>() -> Result<hipDeviceProp_tR0600, CUerror> {
@@ -343,7 +357,30 @@ fn get_cache_key<'a, 'b>(
     Some(zluda_cache::ModuleKey {
         hash: blake3::hash(text.as_bytes()).to_hex(),
         compiler_version: "builtin",
-        zluda_version: "ea59191382b74add94d956261ec6c1bb469244a8",
+        // What identifies the compiler that produced the entry.
+        //
+        // This has to move whenever the generated code can change, or a cache
+        // written by one build is served to another and the difference is
+        // invisible: the entry looks perfectly valid, it was stored under a
+        // perfectly valid key, and every kernel in it is simply the older
+        // translation. This was briefly a frozen literal, which meant that the
+        // four commits that followed it -- hardware WMMA for RDNA 4, WGP mode
+        // enforcement, and a recompiled ptx_impl -- all produced cache hits on
+        // entries built before them, silently negating the work on any machine
+        // whose cache was already warm.
+        //
+        // Three inputs, because the compiled output depends on all three and
+        // they do not move together:
+        //   - this repository's revision (VERGEN_GIT_SHA, from zluda/build.rs);
+        //   - the embedded PTX implementation modules, which are build inputs
+        //     committed to the tree and can be rebuilt without a code change;
+        //   - codegen_parts in `attributes`, added above, which is host
+        //     dependent.
+        zluda_version: concat!(
+            env!("VERGEN_GIT_SHA"),
+            "/",
+            env!("ZLUDA_PTX_IMPL_DIGEST"),
+        ),
         device: isa,
         backend_key: serialized_attributes,
         last_access: zluda_cache::ModuleCache::time_now(),
@@ -369,13 +406,22 @@ fn load_cached_binary(
     let mut binary = cache_with_key
         .as_mut()
         .and_then(|(c, key)| c.get_module_binary(key));
+    // Which key the answer was actually stored under. An entry found through the
+    // legacy key below has to be *removed* through that same key: the two differ
+    // in `backend_key`, and `remove_module` matches on all five fields, so
+    // deleting with the current key would match no row and leave the entry in
+    // place to be found again on the next run.
+    let mut matched_key = cache_with_key.as_ref().map(|(_, key)| key.clone());
     if binary.is_none() && cumode {
         if let Some((c, key)) = cache_with_key.as_mut() {
             let legacy_backend_key = key.backend_key.replace(",\"cumode\":true", "");
             if legacy_backend_key != key.backend_key {
                 let mut legacy_key = key.clone();
                 legacy_key.backend_key = legacy_backend_key;
-                binary = c.get_module_binary(&legacy_key);
+                if let Some(found) = c.get_module_binary(&legacy_key) {
+                    matched_key = Some(legacy_key);
+                    binary = Some(found);
+                }
             }
         }
     }
@@ -388,13 +434,24 @@ fn load_cached_binary(
     // kernel in that module was NOT_FOUND, with nothing to say why. Throwing it
     // out here turns that into one slow run instead of a cache that has to be
     // deleted by hand.
-    if kernels_wanted > 0 && kernel_metadata::count_kernels(&binary).unwrap_or(0) == 0 {
+    //
+    // Only a definite "no kernels" counts. `count_kernels` returns None when it
+    // cannot parse the object at all, and that is not the same statement: it is
+    // not evidence that the entry is bad. Treating the two alike would let a
+    // parse limitation throw away a good translation *and* delete the entry
+    // that produced it, so every run would re-translate and delete again -- the
+    // very "translates all fifteen modules every time" symptom this guard was
+    // written to remove. An unparseable object is trusted here and fails later
+    // with whatever the loader has to say about it.
+    if kernels_wanted > 0 && kernel_metadata::count_kernels(&binary) == Some(0) {
         eprintln!(
             "[zluda] the cached translation of this module has no kernels in it, though the PTX declares {}. Dropping it and translating again.",
             kernels_wanted
         );
-        if let Some((cache, key)) = cache_with_key.as_mut() {
-            cache.remove_module(key);
+        if let Some((cache, _)) = cache_with_key.as_mut() {
+            if let Some(key) = matched_key.as_ref() {
+                cache.remove_module(key);
+            }
         }
         return None;
     }
@@ -477,8 +534,13 @@ fn compile_and_cache(
     //
     // Failing here instead costs a translation that was worthless anyway, and
     // says what happened while there is still something to say it about.
-    let kernels_built = kernel_metadata::count_kernels(&elf_module).unwrap_or(0);
-    if kernels_wanted > 0 && kernels_built == 0 {
+    //
+    // `Some(0)` only. `count_kernels` answers None when it cannot parse the
+    // object, which is a statement about this program and not about the
+    // translation: refusing to cache on that would turn a parse limitation into
+    // a hard compile failure for a module that is perfectly good, where the
+    // loader would have accepted it.
+    if kernels_wanted > 0 && kernel_metadata::count_kernels(&elf_module) == Some(0) {
         eprintln!(
             "[zluda] this module translated to an object with no kernels in it: {} were declared in the PTX and none came out. Not caching it.",
             kernels_wanted
@@ -487,7 +549,17 @@ fn compile_and_cache(
     }
     if let Some((cache, key)) = cache_with_key {
         key.last_access = zluda_cache::ModuleCache::time_now();
-        cache.insert_module(key, &elf_module);
+        // A translation that was not stored is not a failure -- this run has the
+        // object it needs -- but it is the reason the *next* run will translate
+        // the same module again, so it is reported. Silently discarding it is how
+        // "the cache never persists" stays invisible.
+        if let Err(error) = cache.insert_module(key, &elf_module) {
+            eprintln!(
+                "[zluda] the translation of this module could not be written to the cache \
+                 ({}); it will be translated again next time",
+                error
+            );
+        }
     }
     Ok((elf_module, sm_version, metadata32))
 }
