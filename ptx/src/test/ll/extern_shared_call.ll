@@ -8,6 +8,7 @@ define hidden void @incr_shared_2_global() #0 {
   br label %"42"
 
 "42":                                             ; preds = %1
+  call void @llvm.amdgcn.s.dcache.inv()
   %2 = load i64, ptr addrspace(3) @shared_mem, align 8
   store i64 %2, ptr addrspace(5) %"45", align 8
   %3 = load i64, ptr addrspace(5) %"45", align 8
@@ -18,7 +19,10 @@ define hidden void @incr_shared_2_global() #0 {
   ret void
 }
 
-define amdgpu_kernel void @extern_shared_call(ptr addrspace(4) byref(i64) %"50", ptr addrspace(4) byref(i64) %"51") #1 {
+; Function Attrs: nocallback nofree nosync nounwind willreturn
+declare void @llvm.amdgcn.s.dcache.inv() #1
+
+define amdgpu_kernel void @extern_shared_call(ptr addrspace(4) byref(i64) %"50", ptr addrspace(4) byref(i64) %"51") #2 {
   %"52" = alloca i64, align 8, addrspace(5)
   %"53" = alloca i64, align 8, addrspace(5)
   %"54" = alloca i64, align 8, addrspace(5)
@@ -28,6 +32,7 @@ define amdgpu_kernel void @extern_shared_call(ptr addrspace(4) byref(i64) %"50",
   br label %"43"
 
 "43":                                             ; preds = %1
+  call void @llvm.amdgcn.s.dcache.inv()
   %2 = load i64, ptr addrspace(4) %"50", align 8
   store i64 %2, ptr addrspace(5) %"52", align 8
   %3 = load i64, ptr addrspace(4) %"51", align 8
@@ -52,4 +57,5 @@ define amdgpu_kernel void @extern_shared_call(ptr addrspace(4) byref(i64) %"50",
 }
 
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { nocallback nofree nosync nounwind willreturn }
+attributes #2 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }

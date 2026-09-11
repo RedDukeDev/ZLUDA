@@ -17,6 +17,7 @@ define amdgpu_kernel void @assertfail(ptr addrspace(4) byref(i64) %"95", ptr add
   br label %"93"
 
 "93":                                             ; preds = %1
+  call void @llvm.amdgcn.s.dcache.inv()
   %2 = load i64, ptr addrspace(4) %"95", align 8
   store i64 %2, ptr addrspace(5) %"97", align 8
   %3 = load i64, ptr addrspace(4) %"96", align 8
@@ -60,5 +61,9 @@ define amdgpu_kernel void @assertfail(ptr addrspace(4) byref(i64) %"95", ptr add
   ret void
 }
 
+; Function Attrs: nocallback nofree nosync nounwind willreturn
+declare void @llvm.amdgcn.s.dcache.inv() #2
+
 attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
 attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="preserve-sign" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #2 = { nocallback nofree nosync nounwind willreturn }
