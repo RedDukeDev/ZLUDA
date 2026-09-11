@@ -2015,8 +2015,31 @@ impl<'a> MethodEmitContext<'a> {
             let is_array =
                 unsafe { LLVMGetTypeKind(value_type) } == LLVMTypeKind::LLVMArrayTypeKind;
             if space == 3 && is_array && self.function_uses_global(global, 0) {
-                let length = unsafe { LLVMGetArrayLength(value_type) } as u64;
-                let size = unsafe { LLVMConstInt(i32_type, length, 0) };
+                // `llvm.memset` takes a length in *bytes*, while
+                // `LLVMGetArrayLength2` answers in *elements*. Passing the element
+                // count straight through cleared one element's worth of bytes --
+                // sixteen of the sixty-four a `.shared .b32 buf[16]` occupies --
+                // and left the rest holding whatever the previous kernel put
+                // there, which is the non-determinism this clearing exists to
+                // remove.
+                let length = unsafe { LLVMGetArrayLength2(value_type) } as u64;
+                let element_bytes = match unsafe {
+                    llvm_type_size_bytes(LLVMGetElementType(value_type))
+                } {
+                    Some(bytes) => bytes,
+                    None => {
+                        if std::env::var_os("ZLUDA_ZERO_LDS").is_some() {
+                            eprintln!(
+                                "[zluda] cannot work out the element size of a shared array, so \
+                                 it is not being cleared; leaving it alone is safer than \
+                                 clearing the wrong number of bytes"
+                            );
+                        }
+                        global = unsafe { LLVMGetNextGlobal(global) };
+                        continue;
+                    }
+                };
+                let size = unsafe { LLVMConstInt(i32_type, length * element_bytes, 0) };
                 let pointer_type = unsafe { LLVMTypeOf(global) };
                 self.emit_intrinsic(
                     c"llvm.memset.p3.i32",
@@ -3080,7 +3103,7 @@ impl<'a> MethodEmitContext<'a> {
         let a = self.resolver.value(arguments.src1)?;
         let b = self.resolver.value(arguments.src2)?;
 
-        let min_name = format!("llvm.smin.{} ", LLVMTypeDisplay(data.scalar));
+        let min_name = format!("llvm.smin.{}\0", LLVMTypeDisplay(data.scalar));
         let min = self.emit_intrinsic(
             unsafe { CStr::from_bytes_with_nul_unchecked(min_name.as_bytes()) },
             None,
@@ -3089,7 +3112,7 @@ impl<'a> MethodEmitContext<'a> {
         )?;
 
         let zero = unsafe { LLVMConstInt(llvm_type, 0, 0) };
-        let max_name = format!("llvm.smax.{} ", LLVMTypeDisplay(data.scalar));
+        let max_name = format!("llvm.smax.{}\0", LLVMTypeDisplay(data.scalar));
         self.emit_intrinsic(
             unsafe { CStr::from_bytes_with_nul_unchecked(max_name.as_bytes()) },
             Some(arguments.dst),
@@ -3550,12 +3573,20 @@ impl<'a> MethodEmitContext<'a> {
         // has incorrect return type".
         let b32 = ast::Type::Scalar(ast::ScalarType::B32);
         let true_ = unsafe { LLVMConstInt(i1, 1, 0) };
-        let mask = self.emit_intrinsic(
+        let active = self.emit_intrinsic(
             c"llvm.amdgcn.ballot.i32",
             None,
             vec![&b32],
             vec![(true_, i1)],
         )?;
+        // `elect.sync` elects the lowest lane that is both *active* and named in
+        // the member mask. Balloting a constant true answers only the first half,
+        // so the mask has to be applied as well: with a partial mask -- the usual
+        // idiom is `elect.sync _|p, 0x00ff00ff` -- electing the lowest active lane
+        // anywhere in the wavefront picks a lane the caller excluded, and every
+        // lane then disagrees about who was elected.
+        let membermask = self.resolver.value(arguments.src_membermask)?;
+        let mask = unsafe { LLVMBuildAnd(self.builder, active, membermask, LLVM_UNNAMED.as_ptr()) };
         let false_ = unsafe { LLVMConstInt(i1, 0, 0) };
         let leader = self.emit_intrinsic(
             c"llvm.cttz.i32",
@@ -4069,6 +4100,35 @@ impl<'a> MethodEmitContext<'a> {
         result
     }
      */
+}
+
+/// Size in bytes of an LLVM type, for converting an element count into the byte
+/// count `llvm.memset` wants.
+///
+/// The module's data layout would answer this properly, but at the point this is
+/// needed the module does not have one yet -- the target machine sets it later --
+/// so the types this backend actually generates for a `.shared` array are
+/// measured directly. Anything unrecognised answers `None` rather than guessing,
+/// because a wrong length here clears the wrong bytes.
+fn llvm_type_size_bytes(type_: LLVMTypeRef) -> Option<u64> {
+    unsafe {
+        match LLVMGetTypeKind(type_) {
+            LLVMTypeKind::LLVMIntegerTypeKind => Some((LLVMGetIntTypeWidth(type_) as u64) / 8),
+            LLVMTypeKind::LLVMHalfTypeKind => Some(2),
+            LLVMTypeKind::LLVMFloatTypeKind => Some(4),
+            LLVMTypeKind::LLVMDoubleTypeKind => Some(8),
+            LLVMTypeKind::LLVMPointerTypeKind => Some(std::mem::size_of::<usize>() as u64),
+            LLVMTypeKind::LLVMVectorTypeKind => {
+                let lanes = LLVMGetVectorSize(type_) as u64;
+                Some(lanes * llvm_type_size_bytes(LLVMGetElementType(type_))?)
+            }
+            LLVMTypeKind::LLVMArrayTypeKind => {
+                let elements = LLVMGetArrayLength2(type_) as u64;
+                Some(elements * llvm_type_size_bytes(LLVMGetElementType(type_))?)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn not_supported_by_atomics(qualifier: ast::LdStQualifier, underlying_type: *mut LLVMType) -> bool {

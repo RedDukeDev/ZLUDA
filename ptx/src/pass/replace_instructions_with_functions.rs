@@ -392,6 +392,40 @@ fn run_instruction<'input>(
                 },
                 scalar = scalar_to_ptx_name(scalar_type),
             );
+            // Lowering `sust` to a function `zluda_ptx_impl` does not define loses
+            // the whole kernel without a word: the parser was happy, so the
+            // unrecognized-PTX diagnostic stays silent, and the only sign is
+            // `cuModuleGetFunction` reporting a kernel that clearly exists in the
+            // PTX as missing. The implemented forms are a small closed set, so the
+            // ones that are absent are named here instead of being left to be
+            // found that way.
+            //
+            // The parser accepts every combination of {.p,.b} x {.v2,.v4} x
+            // {.b8,.b16,.b32}, and `.surfref` maps to the same TexType::Texref as
+            // `.texref` does, so `sustref_*` is reachable too -- and there is no
+            // `sustref_*` anywhere in the tree.
+            //
+            // `ptx/lib/zluda_ptx_impl.cpp` defines exactly these five. Adding
+            // another means implementing it there *and* rebuilding both
+            // `ptx/lib/*.bc`, which is why this list is written out rather than
+            // derived.
+            const IMPLEMENTED: [&str; 5] = [
+                "sustobj_p_2d_v4_b32",
+                "sustobj_p_2d_b32",
+                "sustobj_b_2d_b32",
+                "sustobj_b_2d_v2_b16",
+                "sustobj_b_2d_v4_b8",
+            ];
+            if !IMPLEMENTED.contains(&name.as_str()) {
+                eprintln!(
+                    "[zluda] `sust` lowering needs `{}`, which zluda_ptx_impl does not define. \
+                     Left as it was, this would drop the entire kernel and report it only as a \
+                     missing kernel. Implement it in ptx/lib/zluda_ptx_impl.cpp and rebuild \
+                     ptx/lib/*.bc.",
+                    name
+                );
+                return Err(error_todo());
+            }
             to_call(resolver, fn_declarations, name.into(), i)?
         }
         i @ ptx_parser::Instruction::Tex {
