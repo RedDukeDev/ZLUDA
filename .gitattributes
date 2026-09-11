@@ -1,3 +1,11 @@
 ext/** linguist-vendored
 *.dll filter=lfs diff=lfs merge=lfs -text
 *.bc filter=lfs diff=lfs merge=lfs -text
+
+# Exception: the two bitcode modules under ptx/lib are build *inputs*, not
+# artifacts. ptx/src/pass/mod.rs includes them with include_bytes! and
+# ptx/build.rs asserts on their magic, so a clone that cannot fetch them fails
+# inside build.rs with a message about LFS rather than about a missing file.
+# They are ~68 KB each; they are stored in the repository like any other source
+# file so that a plain `git clone` is enough to build.
+ptx/lib/*.bc !filter !diff !merge -text

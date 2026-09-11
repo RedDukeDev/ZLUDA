@@ -1,3 +1,21 @@
+# ZLUDA LLVM fork: FP16 WMMA lowering
+#
+# Applied on top of the pinned ext/llvm-project revision (the gitlink in this
+# repository). It teaches MMACombiner to lower
+# zluda_mma_m16n8k16_f32_f16_f16_f32 through the RDNA hardware WMMA unit
+# (amdgcn_wmma_f32_16x16x16_f16), the way the bf16 path already lowers through
+# amdgcn_wmma_f32_16x16x16_bf16.
+#
+# The operand types of the two intrinsics differ and are not interchangeable:
+# int_amdgcn_wmma_f32_16x16x16_f16 is declared
+#   AMDGPUWmmaIntrinsic<llvm_anyfloat_ty, llvm_anyfloat_ty>
+# while ..._bf16 is
+#   AMDGPUWmmaIntrinsic<llvm_anyint_ty,   llvm_anyfloat_ty>
+# so the f16 path must bitcast its <16 x i16> shuffle results to <16 x half>,
+# and the bf16 path must not.
+#
+# Apply with:  git -C ext/llvm-project apply ../../patches/llvm-fp16-wmma.patch
+
 diff --git a/llvm/lib/Transforms/ZLUDA/CombineMMA.cpp b/llvm/lib/Transforms/ZLUDA/CombineMMA.cpp
 index f98629c56..f3b104392 100644
 --- a/llvm/lib/Transforms/ZLUDA/CombineMMA.cpp
