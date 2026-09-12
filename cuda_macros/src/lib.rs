@@ -465,6 +465,18 @@ pub fn test_cuda(_attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #[test]
         fn #cuda_fn() {
+            // The `*_nvidia` half of every test exists to compare ZLUDA against the
+            // real implementation, so it needs the real implementation installed.
+            // Without it `Cuda::new()` panics on `Library::new(..).unwrap()`, and a
+            // machine that simply has no NVIDIA driver turns the whole suite red for a
+            // reason that has nothing to do with the code under test. Skip it instead.
+            // `zluda_common::test_support` is what decides, and it says so once per
+            // process, on the real stderr, so a green run does not quietly skip a third
+            // of itself. `ZLUDA_REQUIRE_CUDA=1` restores the failure, for CI, where the
+            // CUDA half is the whole point.
+            if !::zluda_common::test_support::nvidia_tests_available() {
+                return;
+            }
             unsafe { #fn_name(<crate::tests::Cuda>::new()) }
         }
         #[test]

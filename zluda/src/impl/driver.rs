@@ -816,31 +816,85 @@ mod tests {
         assert_eq!(alloc_info.get_offset_and_info(0x2000 + 8), None);
     }
 
-    #[test_cuda]
-    fn primary_context_is_inactive_on_init(api: impl CudaApi) {
-        api.cuInit(0);
+    /// The primary context state as the driver reports it: `active` is "somebody
+    /// holds a reference", `flags` is what `cuDevicePrimaryCtxSetFlags` recorded.
+    fn primary_ctx_state(api: &impl CudaApi) -> (u32, i32) {
         let mut flags = u32::MAX;
         let mut active = i32::MAX;
         api.cuDevicePrimaryCtxGetState(0, &mut flags, &mut active);
-        assert_eq!(flags, 0);
-        assert_eq!(active, 0);
+        (flags, active)
+    }
+
+    /// The primary context's reference count, taken from ZLUDA's own bookkeeping.
+    ///
+    /// `cuDevicePrimaryCtxGetState` reports only `active = ref_count > 0`, which
+    /// cannot show a 0 -> 1 change when some other test already holds a reference.
+    /// The count itself can, and `crate::tests::primary_context_guard` is what keeps
+    /// those other tests from moving it during the measurement. Callers must hold the
+    /// guard.
+    fn primary_ctx_ref_count() -> u32 {
+        let (context, _) = crate::r#impl::device::get_primary_context(0).unwrap();
+        let mut ref_count = u32::MAX;
+        context
+            .with_state(|state| {
+                ref_count = state.ref_count;
+                Ok(())
+            })
+            .unwrap();
+        ref_count
+    }
+
+    #[test_cuda]
+    fn primary_context_is_inactive_on_init(api: impl CudaApi) {
+        let _turn = crate::tests::primary_context_guard();
+        api.cuInit(0);
+        // `cuInit` must not activate the primary context: CUDA creates it lazily, on
+        // first use, so that initializing the driver does not cost a context.
+        //
+        // Only the change is asserted, not the absolute state. This test binary is one
+        // process, the primary context is process-global, and the tests that retain it
+        // never give it back, so "inactive" is observable only if this test happens to
+        // run first - which is not something a test gets to decide. What it can always
+        // decide is whether `cuInit` moved the count, and that is the property.
+        let before = primary_ctx_ref_count();
+        api.cuInit(0);
+        let after = primary_ctx_ref_count();
+        assert_eq!(after, before, "cuInit must not retain the primary context");
+        if before == 0 {
+            // Nothing has used it, which is the state every program starts in, so the
+            // original assertions can be made exactly.
+            let (flags, active) = primary_ctx_state(&api);
+            assert_eq!(flags, 0, "cuInit must not set flags on the primary context");
+            assert_eq!(
+                active, 0,
+                "the primary context must not be active right after cuInit"
+            );
+        }
     }
 
     #[test_cuda]
     unsafe fn cudart_interface_fn2_creates_inactive_primary_ctx(api: impl CudaApi) {
+        let _turn = crate::tests::primary_context_guard();
         api.cuInit(0);
         let mut table_ptr = std::ptr::null();
         api.cuGetExportTable(&mut table_ptr, &dark_api::cuda::CudartInterface::GUID);
         let cuda_rt_iface = dark_api::cuda::CudartInterface::new(table_ptr);
+        let before = primary_ctx_ref_count();
         let mut dark_ctx = std::mem::zeroed();
         cuda_rt_iface
             .cudart_interface_fn2(&mut dark_ctx, 0)
             .unwrap();
-        let mut flags = u32::MAX;
-        let mut active = i32::MAX;
-        api.cuDevicePrimaryCtxGetState(0, &mut flags, &mut active);
-        assert_eq!(flags, 0);
-        assert_eq!(active, 0);
+        let after = primary_ctx_ref_count();
+        // The hook is what cudart calls while starting up, so it has to hand out the
+        // context without activating it: a context that came up active would be one
+        // the program never asked for. `after` is read before the `Retain` below on
+        // purpose - retaining is exactly what moves this count.
+        assert_eq!(
+            after, before,
+            "cudart_interface_fn2 must not retain the primary context"
+        );
+        // And what it handed out has to be that context. Unconditional, and the
+        // stronger half of the test.
         let mut primary_ctx = std::mem::zeroed();
         api.cuDevicePrimaryCtxRetain(&mut primary_ctx, 0);
         assert_eq!(dark_ctx.0, primary_ctx.0);

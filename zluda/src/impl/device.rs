@@ -569,6 +569,11 @@ mod tests {
 
     #[test_cuda]
     unsafe fn primary_ctx_retain_does_not_make_it_active(api: impl CudaApi) {
+        // This test retains the primary context and does not give it back (releasing
+        // the last reference would reset the context, and other tests in this process
+        // may still be using it), so it has to take the same turn as the tests in
+        // `driver` that assert on the reference count.
+        let _turn = crate::tests::primary_context_guard();
         api.cuInit(0);
         let mut current_ctx = mem::zeroed();
         api.cuCtxGetCurrent(&mut current_ctx);

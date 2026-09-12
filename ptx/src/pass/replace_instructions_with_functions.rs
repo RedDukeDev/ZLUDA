@@ -430,23 +430,29 @@ fn run_instruction<'input>(
                 "sustobj_b_2d_v4_b32",
             ];
             if !IMPLEMENTED.contains(&name.as_str()) {
-                if name.starts_with("sustref_") {
-                    eprintln!(
-                        "[zluda] `sust` lowering for `{}` rejected: surface references (.surfref) \
+                // The message goes two ways on purpose. `error_todo_msg` puts it in
+                // the error, so it reaches the code that asked for the module
+                // (`cuModuleLoadData` reports it) instead of only the terminal that
+                // happened to be watching; the `eprintln!` is what survives a caller
+                // that throws the error away, which is the common case for a graphics
+                // workload that only knows the load failed. Plain `error_todo()` would
+                // have carried an empty message and left the reason nowhere but stderr.
+                let message = if name.starts_with("sustref_") {
+                    format!(
+                        "`sust` lowering for `{name}` rejected: surface references (.surfref) \
                          have no host runtime binding support (cuSurfRefSetArray is unimplemented). \
-                         Use surface objects (.surfobj / 64-bit integer handle) instead.",
-                        name
-                    );
+                         Use surface objects (.surfobj / 64-bit integer handle) instead."
+                    )
                 } else {
-                    eprintln!(
-                        "[zluda] `sust` lowering needs `{}`, which zluda_ptx_impl does not define. \
+                    format!(
+                        "`sust` lowering needs `{name}`, which zluda_ptx_impl does not define. \
                          Left as it was, this would drop the entire kernel and report it only as a \
                          missing kernel. Implement it in ptx/lib/zluda_ptx_impl.cpp and rebuild \
-                         ptx/lib/*.bc.",
-                        name
-                    );
-                }
-                return Err(error_todo());
+                         ptx/lib/*.bc."
+                    )
+                };
+                eprintln!("[zluda] {message}");
+                return Err(error_todo_msg(message));
             }
             to_call(resolver, fn_declarations, name.into(), i)?
         }

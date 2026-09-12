@@ -1704,6 +1704,25 @@ extern "C"
         store_2D(surfobj, coord, splat);
     }
 
+    // The twelve `sustref_*` entry points below are currently unreachable, and are
+    // kept only because the assumption they encode is the right one *if* the host
+    // side ever provides it. `sust` with a `.surfref` operand is rejected before
+    // codegen (the `IMPLEMENTED` list in
+    // ptx/src/pass/replace_instructions_with_functions.rs), because nothing in ZLUDA
+    // can bind an array to a surface reference: `cuSurfRefSetArray` is an
+    // unimplemented stub, while `cuModuleGetSurfRef` is wired to `hipModuleGetTexRef`
+    // (zluda/src/impl/module.rs), i.e. to the *texture* reference path. Reading a
+    // `.surfref` variable therefore finds nothing, and the store would go to a null
+    // descriptor.
+    //
+    // Two things have to stay true if these are ever switched on:
+    //   1. `surfaceObject` is at offset 0 (ROCm hip/surface_types.h), unlike
+    //      `textureReference.textureObject`, which `texref_*` reads at offset 72.
+    //      The two offsets are not interchangeable.
+    //   2. What the runtime writes there has to be a real `hipSurfaceObject_t`, i.e.
+    //      the page made by `cuSurfObjectCreate`, not a texture object: a texture
+    //      object's descriptor says read-only in byte 14, and hardware rejects a
+    //      store through it.
     void FUNC(sustref_p_2d_b32)(struct surfaceReference GLOBAL_SPACE * surfref, v2s32 coord, s32 data)
     {
         FUNC_CALL(sustobj_p_2d_b32)(uint64_t(surfref->surfaceObject), coord, data);

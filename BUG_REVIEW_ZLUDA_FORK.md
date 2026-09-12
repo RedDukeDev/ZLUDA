@@ -1192,3 +1192,178 @@ let cuda = match &*CUDA { Ok(cuda) => cuda, Err(_) => return Ok(()) };
 | 读 golden `.ll`（`vector_extract` / `div_ftz`） | `.b8`→`i8`、`.v4.b8`→`<4 x i8>`，与 `.bc` 形参一致（N9） |
 
 **没有做**：N10 的实机验证（`sustref` 到底会不会读到 0）——这需要一个能绑定 `.surfref` 的路径，而那条路径正是缺失的东西；所以它是**源码级定论 + 逻辑推论**，不是实测。想实测只有一条路：先实现 `cuSurfRefSetArray`。另外我**没有改动任何仓库文件**（唯一的临时脚本放在 `%TEMP%\zlu\`），`ptx/src/pass/replace_instructions_with_functions.rs` 的注释现在与事实一致（「All valid 2D combinations parsed by ptx_parser are implemented in ptx/lib/zluda_ptx_impl.cpp」——已按 N8 核实为真）。
+
+---
+
+# U. 第九轮验证（HEAD = `27d810b`）—— N10/N11/N12 全部已修，且 `sust` 首次有了实机验证
+
+**结论**：三条建议全部落实，其中 N12 的实机测试**一次通过**——这是 `sust` 这条指令从有实现以来第一次在真实 GPU 上被验证。剩下的只有三条无关紧要的收尾（U5–U7）。
+
+## U1 ✅ N10 已修：`sustref_*` 从白名单移除并在编译期拒绝
+
+`IMPLEMENTED` 现在是 12 个 `sustobj_*`（`replace_instructions_with_functions.rs:422-434`），且 `name.starts_with("sustref_")` 时给出**指名道姓**的 stderr：
+
+```
+[zluda] `sust` lowering for `sustref_b_2d_b32` rejected: surface references (.surfref) have no
+host runtime binding support (cuSurfRefSetArray is unimplemented). Use surface objects
+(.surfobj / 64-bit integer handle) instead.
+```
+
+这比原来那条「implement it in zluda_ptx_impl.cpp」的通用提示好，因为它说的是**真正的缺环在宿主侧**，而不是让人去改设备端。新增的 `sustref_rejected_at_compile_time` 用 `catch_unwind` 同时覆盖了 debug（`error_todo()` → `unreachable!()` panic）与 release（→ `Err(TranslateError::Todo)`）两条路径。
+
+**现在的状态是自洽的**：解析器能产生 24 个名字（N8），白名单收下 12 个**真能跑**的、拒绝 12 个跑不了的 —— 白名单的含义回到「这个名字真的能用」。
+
+## U2 ✅ N11 已修：一次性的 stderr 提示 + `ZLUDA_REQUIRE_CUDA=1`
+
+`spirv_run/mod.rs:1441-1460`：跳过前用 `AtomicBool::swap` 保证**只提示一次**，并给出 `{:?}` 的具体加载错误；`ZLUDA_REQUIRE_CUDA` 置位则改为 panic。CI 上不会再出现「绿色但 CUDA 对照没跑」的静默。
+
+## U3 ✅✅ N12 已修，而且**实机通过** —— `sust` 第一次被真实 GPU 验证
+
+```powershell
+cargo test -p zluda --lib -- impl::tex::tests::surfobj_write_2d_b32_zluda --nocapture
+# test r#impl::tex::tests::surfobj_write_2d_b32_zluda ... ok
+# test result: ok. 1 passed; 0 failed
+```
+
+这个测试的设计比我建议的还周全，四条独立断言的覆盖面如下：
+
+| 断言 | 验证的是什么 |
+|---|---|
+| `readback[3*8+4] == 0x12345678`，`.b` 形态传 `coord_x = 16`（字节） | `byte_x_to_sample_x` 真的把字节坐标按 4 字节/通道 ÷4 成了样本 4 —— **这正是 `.b` 与 `.p` 的分界**，若不做除法则写到样本 16（越界丢弃）→ 断言会失败，所以这条断言是**有鉴别力的** |
+| `readback[5*8+6] == 0xdeadbeef`，`.p` 形态传 `coord_x = 6`（像素） | `.p` 路径**不**做字节换算，坐标即样本 |
+| 其余 62 个像素必须仍为 0 | 没有越界/串写（描述符与 `NumChannels` 处理正确） |
+| `cuSurfObjectGetResourceDesc` 回读 `resType == ARRAY` 且 `hArray == array` | 顺带把我在 N2/`tex.rs` 那条「描述符零清后回读」的修复也钉住了 |
+
+**顺带获得的结论**：这同时**回溯验证了改动前就存在的那 5 个 `sustobj_*`**（`sust.b.2d.b32` / `sust.p.2d.b32` 就是其中两个），也就是说之前那条「整个 `sust` 家族零覆盖」的缺口关掉了。至此 `.b`/`.p` 两条坐标语义在硬件上都有了对照。
+
+## U4 ✅ 回归全绿
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p ptx --lib` | **585 passed / 0 failed**（+1 = 新增的拒绝测试） |
+| `cargo test -p zluda --lib -- impl::tex::tests --skip _nvidia` | **5 passed / 0 failed**（4 个既有 + 新的 surfobj） |
+| `cargo check`（6 个 crate） | 退出码 0 |
+
+## U5 🟡 收尾一：`return Err(error_todo())` 把消息丢了，建议改用 `error_todo_msg`
+
+`error_todo()` 在 release 下返回 `TranslateError::Todo("")` —— **空字符串**，于是 `CompilerError` 只显示 `PTX TranslateError::TODO`，原因只存在于 stderr。`ptx/src/pass/mod.rs:293` 的 `error_todo_msg` 就是为这种情况准备的，而且同文件 `emit.rs:2140` / `:3862` 已经在用。把两处 `error_todo()` 换成 `error_todo_msg(format!(...))`（debug 下仍是 `unreachable!("{}", msg)`），诊断信息才会跟着错误一路传到 API 调用方，而不只是终端。
+
+## U6 🟢 收尾二：`ptx/lib/zluda_ptx_impl.cpp` 里那 12 个 `sustref_*` 现在是死代码
+
+留着无害（`.bc` 里未被引用的 `linkonce_odr` 会被优化掉，而构建管线本来就会 strip `@llvm.used`），而且**如果将来按「option 2」实现 `cuSurfRefSetArray`（建真 surface object、把句柄写进偏移 0），这 12 个函数原样就可用**。建议在它们旁边加一行注释记下这个决定与前提（偏移 0 = `hip/surface_types.h` 的 `surfaceReference.surfaceObject`；**不是** `texref_*` 用的偏移 72），否则下一个人会以为它们已经是活代码、或者照着 `texref_*` 去改偏移。
+
+## U7 🟡 收尾三（既有问题，与本次改动无关）：`zluda` crate 有两个测试依赖「进程刚启动」的全局状态
+
+```
+cargo test -p zluda --lib            → 19 passed / 20 failed
+cargo test -p zluda --lib -- --skip _nvidia --test-threads=1
+                                     → 18 passed / 2 failed   (left: 1, right: 0)
+```
+
+- 20 个失败里 **19 个是 `_nvidia`**：`zluda/src/tests.rs:12` 的 `Library::new("C:\\Windows\\System32\\nvcuda.dll").unwrap()` 在这台机器上必然 panic（U2 的修复只覆盖了 `ptx` crate，`zluda` crate 的 `#[test_cuda]` 还是老样子）。
+- 剩下 **1 个是真失败**：`primary_context_is_inactive_on_init_zluda` 与 `cudart_interface_fn2_creates_inactive_primary_ctx_zluda` 断言 `flags == 0 && active == 0`，即「primary context 还没被碰过」。但同一个进程里任何先跑的测试（`init_zluda`、tex/surf 测试都会建 context）都会把 `flags` 变成 1。**证据**：单独跑 `cudart_interface_fn2_..._zluda` → `ok`；跟在套件后面串行跑 → 两个都失败。`zluda/src/impl/driver.rs` 自 `ea59191` 起没再改过，断言也一字未动（`git show 4d1dc62:zluda/src/impl/driver.rs` 里同样在 825/842 行），所以**不是这次改动引入的**。
+- 处理建议：这两个测试要么 `#[ignore]` + 单独入口，要么把断言改成「自己 retain 前后的一致性」而不是「全进程从未被碰过」。顺带用 `--skip _nvidia`（或给 `zluda/src/tests.rs` 也加同一个 guard）就能让本地套件恢复全绿。
+
+---
+
+# V. 第十轮：U5 / U6 / U7 的修复与复核
+
+三条都改了，并且每一条都做了「改之前能不能复现、改之后能不能证明」的对照。汇总：
+
+| 项 | 改动 | 复核结果 |
+|---|---|---|
+| U5 | `sust` 拒绝路径改用 `error_todo_msg(message)`，消息同时进错误与 stderr | `cargo test -p ptx --lib` → **585 passed / 0 failed**（含 `sustref_rejected_at_compile_time`） |
+| U6 | `ptx/lib/zluda_ptx_impl.cpp` 里 12 个 `sustref_*` 上方加决策注释 | 用同一 clang 重编译后与提交的 `.bc` 比：**152/152 符号、0 签名差异**（见下） |
+| U7a | 两个 primary-context 测试改为「测量变化量」+ 测试专用锁 | `cargo test -p zluda --lib` → **39 passed / 0 failed**（此前 19/20），并行 ×3 与串行均绿 |
+| U7b | `_nvidia` 半套在无驱动时跳过，且**提示可见、每进程只打一次** | 提示各出现 1 次；`ZLUDA_REQUIRE_CUDA=1` 按预期失败 |
+
+## V1 U5：消息现在既进错误也进终端
+
+`error_todo()` 在 release 下返回 `TranslateError::Todo("")`，经 `CompilerError` 只显示成 `PTX TranslateError::TODO`。现在两处拒绝分支先构造 `message`，再
+
+```rust
+eprintln!("[zluda] {message}");
+return Err(error_todo_msg(message));
+```
+
+`error_todo_msg` 是仓库里已有的机制（`emit.rs:2140`、`:3862` 在用），debug 下是 `unreachable!("{}", msg)`，所以现在连调试构建的 panic 消息里也带着原因。原来的 `eprintln!` 保留，因为图形程序拿到 `cuModuleLoadData` 失败后往往把错误丢掉，stderr 是唯一还留着原因的地方。
+
+## V2 U6：只加注释，并且**证明**了 `.bc` 不受影响
+
+注释写在 12 个 `sustref_*` 上方，说明三件事：这些函数当前不可达（白名单已拒）、为什么（`cuSurfRefSetArray` 是未实现桩，`cuModuleGetSurfRef` 走的是 texref 路径）、以及将来要启用时必须成立的两个前提（偏移 0 = `surfaceReference.surfaceObject` 而非 texref 的 72；写进去的必须是 `cuSurfObjectCreate` 造的真 surface object，因为 texture 描述符字节 14 是只读的）。
+
+「改注释不需要重建 `.bc`」这句话我没有直接下结论，而是验证了：
+
+```
+clang(ROCm 7.1) 重新编译当前 .cpp → llvm-dis → 与「加注释之前」的同一份重编译结果 compare
+差异 6 行，全部是 ModuleID 与 __hip_cuid_<hash>
+```
+
+而 `__hip_cuid`、`llvm.used`、`llvm.compiler.used` 正是构建管线里被 `sed` 显式删掉的三类符号，我直接检查了提交的 `.bc`：**三者都不在里面**。所以注释在提交产物上不可能有任何痕迹；符号/签名比对也仍是 152/152、0 差异。
+
+## V3 U7a：那两个测试真正的毛病，以及为什么之前的修法还不够
+
+先把根因钉死（三条都是实测）：
+
+1. `primary_context_get_state` 的 `active` 就是**ZLUDA 自己的 `ref_count > 0`**（`device.rs:540`），`flags` 由 `ContextState::new/reset` 置 0 且 `primary_context_set_flags` 是空实现 → **`flags` 一直是 0，只有 `active` 会被别人改**。
+2. 全仓库只有 `primary_context_retain` 加计数、`primary_context_release` 减计数；测试里只有两处 retain：`device.rs` 与 `driver.rs` 各一处，而且**都不释放**（释放到 0 会触发 `state.reset()`，把 primary context 上的 module 全 drop 掉，反而会伤到并行跑的其它测试）。
+3. 所以 `active == 0` 这个断言只能由「谁先跑」决定，而不是由被测代码决定。**我第一版的「只断言变化量」也还是不够**：它同样会被并发 retain 打穿 —— 实测 `left: (0, 1) right: (0, 0)`，而该测试单独跑是 `ok`。
+
+因此最终版本做了两件事，缺一不可：
+
+- `zluda/src/tests.rs` 里加一把**测试专用互斥量** `primary_context_guard()`（中毒锁自行恢复，一个测试失败不至于连坐），三个会 retain 的测试都持有它 → 测量期间没有别人能动这个计数；
+- 测量的是 **`ContextState::ref_count` 本身**（测试模块可以访问 crate 内部），而不是 `active` 这个布尔：布尔值在「已经有人持引用」时会把 `0 -> 1` 的变化藏起来，计数不会。断言因此变成
+
+  ```rust
+  assert_eq!(after, before, "cuInit must not retain the primary context");
+  if before == 0 { /* 全新进程的初始状态，原来的严格断言此刻仍然成立 */
+      assert_eq!(flags, 0);
+      assert_eq!(active, 0);
+  }
+  ```
+
+  同理 `cudart_interface_fn2` 那条：先断言计数没被它动过，再 `Retain` 并断言它返回的句柄就是 primary context（后者无条件成立，是这条测试最有力的部分）。
+
+结果：`cargo test -p zluda --lib` **39 passed / 0 failed**，并行连跑三次、`--test-threads=1` 串行一次，全部一致；每个测试单独跑也都是 `ok`。
+
+**没做的一件事，以及为什么**：`retain` 之后仍然不 `Release`。释放最后一个引用会 `reset()` 掉 primary context 并 drop 其上的 module，而同一个进程里可能有别的测试正在用它——用「新引入一类互相干扰」去换「断言更强」不划算。代价是：如果那两个 retain 的测试先跑，`before != 0`，严格分支就不会执行（不过「`cuInit` 没有动计数」这条总在断言）。想让严格断言永无条件地成立，只能把这两个测试放进**独立进程**的测试二进制；`zluda` 目前 `crate-type = ["cdylib"]`，集成测试链不进来，要改就得加 `"rlib"`（代价是该 crate 编译两次，约 13 分钟的开发循环会再涨一截）。这条我留给你定，没有擅自改构建配置。
+
+## V4 U7b：跳过是对的，但「跳过提示」本身有两个坑
+
+`test_cuda` 现在这样开头：
+
+```rust
+if !::zluda_common::test_support::nvidia_tests_available() {
+    return;
+}
+unsafe { #fn_name(<crate::tests::Cuda>::new()) }
+```
+
+实现放在 `zluda_common/src/test_support.rs`（三个用这个宏的 crate 都依赖它）。过程中撞到两个不查就发现不了的问题：
+
+1. **`eprintln!` 的提示在绿色运行里根本看不见。** libtest 会捕获测试线程的输出、只在测试**失败**时回放。而这条提示说的恰恰是「这些测试不会跑」——也就是说，它在唯一需要它的场景（全绿）里正好被吞掉。改成直接写描述符（`std::io::stderr().write_fmt(...)`，绕开捕获机制）之后才真的可见；`ptx` 里 N11 那条提示有同样的毛病，一并改了（现在能看到真实原因：`LoadLibraryExW ... code: 126`）。
+2. **「只提示一次」的 flag 不能放在宏里。** 属性宏是**每个测试各展开一次**，函数体里的 `static WARNED` 就变成每个测试各一份 —— 实测 `--nocapture` 下同一句话打了 4 次（全量会是 19 次）。所以 flag 与探测逻辑一起放进 `zluda_common::test_support`（一个进程一份），现在正常运行时**恰好一行**：
+
+   ```
+   [zluda] C:\Windows\System32\nvcuda.dll not found: skipping every *_nvidia test. Set ZLUDA_REQUIRE_CUDA=1 to fail instead.
+   ```
+
+`ZLUDA_REQUIRE_CUDA=1` 也验证过确实会失败，且消息里带路径：`ZLUDA_REQUIRE_CUDA is set, but the NVIDIA driver is not at C:\Windows\System32\nvcuda.dll`。顺带把 `zluda/src/tests.rs` 里重复的路径常量改成引用同一份（`CUDA_DRIVER_PATH`），免得「探测用的路径」和「加载用的路径」哪天走岔。
+
+**一处差点漏掉的验证**：第一次跑 `cargo check -p zluda_blas -p zluda_dnn9 --tests` 只用了 4.5 秒就 `Finished`，说明它们**根本没有被重新检查**（缓存命中），那次「通过」什么也没证明。`touch` 一下宏源码强制重新展开后，两个 crate 连同依赖才真正被重新检查（这次能看到 `Checking zluda_blas` / `Checking zluda_dnn9`），结果无误 —— 也就是说这个宏改动对另外两个使用它的 crate 是中性的。
+
+## V5 这一轮的验证清单
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p zluda --lib`（并行 ×3） | **39 passed / 0 failed**（三次一致） |
+| `cargo test -p zluda --lib -- --test-threads=1` | **39 passed / 0 failed** |
+| `ZLUDA_REQUIRE_CUDA=1 cargo test -p zluda --lib -- ..._nvidia` | 按预期 FAILED，消息含路径 |
+| `cargo test -p ptx --lib` | **585 passed / 0 failed** |
+| `cargo test -p zluda_cache` | **5 passed / 0 failed** |
+| `cargo test -p zluda_common` | 0 tests，编译通过 |
+| `cargo check -p zluda_common -p cuda_macros -p ptx -p zluda32 -p zluda64_server` | `Finished`，退出码 0 |
+| `cargo check -p zluda_blas -p zluda_dnn9 --tests`（强制重展开后） | `Finished`，退出码 0 |
+| 重编译 `.cpp` 对比提交的 `.bc` | 152/152 符号、0 签名差异（V2） |
+
+**改动文件**：`cuda_macros/src/lib.rs`、`ptx/src/pass/replace_instructions_with_functions.rs`、`ptx/src/test/spirv_run/mod.rs`、`ptx/lib/zluda_ptx_impl.cpp`（仅注释）、`zluda/src/tests.rs`、`zluda/src/impl/driver.rs`、`zluda/src/impl/device.rs`、`zluda_common/src/lib.rs`、新增 `zluda_common/src/test_support.rs`。没有提交，留给你看过再定。

@@ -1450,11 +1450,17 @@ fn test_cuda_assert<
             }
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[zluda] Warning: NVIDIA CUDA driver DLL not found ({:?}). \
-                     Skipping _cuda comparison tests (set ZLUDA_REQUIRE_CUDA=1 to fail instead).",
+                // Written to the descriptor rather than through `eprintln!`, which the
+                // test harness captures and replays only for tests that fail: this
+                // notice is about the tests that will not run, so it has to survive a
+                // green run to be worth anything.
+                use std::io::Write;
+                let mut stderr = std::io::stderr();
+                let _ = stderr.write_fmt(format_args!(
+                    "[zluda] NVIDIA CUDA driver not usable ({:?}): skipping the _cuda half of \
+                     these tests. Set ZLUDA_REQUIRE_CUDA=1 to fail instead.\n",
                     err
-                );
+                ));
             }
             return Ok(());
         }
