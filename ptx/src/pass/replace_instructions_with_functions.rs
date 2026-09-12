@@ -253,73 +253,7 @@ fn run_statements<'input>(
                         }
                     }
                 }
-                Statement::Instruction(ast::Instruction::Cvt {
-                    data:
-                        ast::CvtDetails {
-                            from: from @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
-                            to: ast::ScalarType::F16x2,
-                            mode: _,
-                        },
-                    arguments:
-                        ast::CvtArgs {
-                            dst,
-                            src,
-                            src2: None,
-                        },
-                }) => {
-                    let from_str = match from {
-                        ast::ScalarType::E4m3x2 => "e4m3x2",
-                        ast::ScalarType::E5m2x2 => "e5m2x2",
-                        _ => unreachable!(),
-                    };
-                    let packed_output = resolver.register_unnamed(Some((
-                        ast::Type::Scalar(ast::ScalarType::B32),
-                        ast::StateSpace::Reg,
-                    )));
-                    let name = format!("cvt_rn_f16x2_{}", from_str);
-                    let return_arguments = vec![(
-                        ast::Type::Scalar(ast::ScalarType::B32),
-                        ast::StateSpace::Reg,
-                    )];
-                    let input_arguments = vec![(
-                        ast::Type::Scalar(ast::ScalarType::B16),
-                        ast::StateSpace::Reg,
-                    )];
-                    let func = get_or_declare_function(
-                        resolver,
-                        fn_declarations,
-                        name,
-                        &return_arguments,
-                        &input_arguments,
-                    );
-                    smallvec![
-                        Statement::Instruction::<_, SpirvWord>(ast::Instruction::Call {
-                            data: ptx_parser::CallDetails {
-                                uniform: false,
-                                return_arguments,
-                                input_arguments,
-                            },
-                            arguments: ptx_parser::CallArgs {
-                                return_arguments: vec![packed_output],
-                                func,
-                                input_arguments: vec![src],
-                                is_external: true,
-                            },
-                        }),
-                        Statement::Instruction(ast::Instruction::Cvt {
-                            data: ast::CvtDetails {
-                                from: ast::ScalarType::B32,
-                                to: ast::ScalarType::F16x2,
-                                mode: ast::CvtMode::Bitcast
-                            },
-                            arguments: ast::CvtArgs {
-                                dst,
-                                src: packed_output,
-                                src2: None,
-                            },
-                        })
-                    ]
-                }
+
                 Statement::<ast::Instruction<SpirvWord>, SpirvWord>::Instruction(instruction) => {
                     smallvec![
                         Statement::<ast::Instruction<SpirvWord>, SpirvWord>::Instruction(
@@ -722,54 +656,7 @@ fn run_instruction<'input>(
         i @ ptx_parser::Instruction::Nanosleep { .. } => {
             to_call(resolver, fn_declarations, "nanosleep_u32".into(), i)?
         }
-        i @ ptx_parser::Instruction::Cvt {
-            data:
-                ptx_parser::CvtDetails {
-                    from: ast::ScalarType::F32,
-                    to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
-                    mode: _,
-                },
-            arguments: _,
-        } => {
-            let to = match to {
-                ptx_parser::ScalarType::E4m3x2 => "e4m3x2",
-                ptx_parser::ScalarType::E5m2x2 => "e5m2x2",
-                _ => unreachable!(),
-            };
-            // Conversions from f32 to f8 must have two source arguments.
-            // satfinite is mandatory for conversions to e4m3x2.
-            to_call(
-                resolver,
-                fn_declarations,
-                format!("cvt_rn_satfinite_{}_f32", to).into(),
-                i,
-            )?
-        }
-        // Packing a pair of halves straight into a pair of fp8 bytes. Unlike the
-        // f32 form this one carries .relu, which clamps to [0, +inf) and maps NaN to
-        // zero before converting.
-        i @ ptx_parser::Instruction::Cvt {
-            data:
-                ast::CvtDetails {
-                    from: ast::ScalarType::F16x2,
-                    to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
-                    mode: ast::CvtMode::FPTruncate { relu, .. },
-                },
-            arguments: _,
-        } => {
-            let to = match to {
-                ptx_parser::ScalarType::E4m3x2 => "e4m3x2",
-                ptx_parser::ScalarType::E5m2x2 => "e5m2x2",
-                _ => unreachable!(),
-            };
-            let relu = if relu { "relu_" } else { "" };
-            to_call(
-                resolver,
-                fn_declarations,
-                format!("cvt_rn_satfinite_{relu}{to}_f16x2").into(),
-                i,
-            )?
-        }
+
         i @ ptx_parser::Instruction::LdMatrix { data, .. } => {
             let shape = match data.shape {
                 ptx_parser::MatrixShape::M8n8 => "m8n8",

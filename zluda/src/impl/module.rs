@@ -52,6 +52,7 @@ impl ModuleMutable {
                     base: func_handle,
                     sm_version,
                     explicit_args_size_align,
+                    name: entry.key().to_string_lossy().into_owned(),
                 });
                 &*entry.insert(func)
             }
@@ -275,6 +276,12 @@ fn get_best_ptx_and_compile(
         is_debug: cfg!(debug_assertions),
         cumode,
         codegen_parts,
+        ignore_maxnreg: std::env::var("ZLUDA_IGNORE_MAXNREG")
+            .map(|v| v == "1")
+            .unwrap_or(false),
+        num_vgpr_override: std::env::var("ZLUDA_NUM_VGPR")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok()),
     };
     let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
         (Some(text), Some(p)) => (|| {
@@ -316,11 +323,23 @@ pub(crate) fn load_hip_module(
     get_best_ptx_and_compile(global_state, library)
 }
 
+// The two launch-tuning fields below are skipped when unset, so a build
+// without them serializes byte-for-byte like a build that predates them:
+// adding the fields must not invalidate every existing cache entry.
 #[derive(serde::Serialize)]
 struct ExtraCacheAttributes {
     is_debug: bool,
     clock_rate: u32,
     cumode: bool,
+    /// ZLUDA_IGNORE_MAXNREG: drop the PTX .maxnreg directive instead of
+    /// enforcing it as amdgpu-num-vgpr. Belongs in the key because the
+    /// compiled code differs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    ignore_maxnreg: bool,
+    /// ZLUDA_NUM_VGPR: force the per-function VGPR budget. Belongs in the key
+    /// because the compiled code differs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_vgpr_override: Option<u32>,
     /// How many parts the module is cut into before code generation.
     ///
     /// This belongs in the key because it changes the output: splitting narrows
@@ -380,6 +399,12 @@ fn get_cache_key<'a, 'b>(
             env!("VERGEN_GIT_SHA"),
             "/",
             env!("ZLUDA_PTX_IMPL_DIGEST"),
+            // The two hashes above cannot see changes to this crate's own
+            // translation passes: the git sha freezes before the commit lands
+            // and the digest only covers the bitcode. Any change to emitted
+            // code bumps this marker, or every user with a warm cache keeps
+            // running the binary the old key compiled.
+            "/fp8-inline-r1",
         ),
         device: isa,
         backend_key: serialized_attributes,
@@ -475,6 +500,8 @@ fn compile_and_cache(
         ptx::Attributes {
             clock_rate: attributes.clock_rate,
             cumode: llvm_zluda::is_cumode(gcn_arch),
+            ignore_maxnreg: attributes.ignore_maxnreg,
+            num_vgpr_override: attributes.num_vgpr_override,
         },
         |_| {},
     )

@@ -325,6 +325,7 @@ test_ptx!(
     [0x36EDu16]
 );
 test_ptx!(cvt_rn_f16x2_e4m3x2, [0x2D55u16], [0x36804a80u32]);
+test_ptx!(cvt_rn_satfinite_e4m3x2_f16x2, [0x36804a80u32], [0x2D55u16]);
 test_ptx!(cvt_rn_f16x2_e5m2x2, [0x36EDu16], [0x3600ED00u32]);
 test_ptx!(cvt_rn_bf16x2_f32, [0.40625, 12.9f32], [0x3ED0414Eu32]);
 test_ptx!(clz, [0b00000101_00101101_00010011_10101011u32], [5u32]);
@@ -1344,6 +1345,8 @@ fn test_hip_assert<
         pass::Attributes {
             clock_rate: 2124000,
             cumode: true,
+            ignore_maxnreg: false,
+            num_vgpr_override: None,
         },
         |_| {},
     )
@@ -1371,6 +1374,8 @@ fn test_zluda32_assert<
         pass::Attributes {
             clock_rate: 2124000,
             cumode: true,
+            ignore_maxnreg: false,
+            num_vgpr_override: None,
         },
         |_| {},
     )
@@ -1392,6 +1397,8 @@ fn test_llvm_assert(
         pass::Attributes {
             clock_rate: 2124000,
             cumode: true,
+            ignore_maxnreg: false,
+            num_vgpr_override: None,
         },
         |_| {},
     )

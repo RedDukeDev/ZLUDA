@@ -112,6 +112,8 @@ fn ptx_to_llvm(ignore_errors: bool, ptx: &str) -> Result<LLVMArtifacts, Compiler
         ptx::Attributes {
             clock_rate: 2124000,
             cumode: true,
+            ignore_maxnreg: false,
+            num_vgpr_override: None,
         },
         |pass| {
             report_pass_time(pass, &mut start);

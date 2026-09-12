@@ -1,12 +1,15 @@
 use cuda_types::cuda::{CUfunction, CUfunction_attribute, CUkernel};
 use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
+use std::io::Write;
 use std::mem;
 
 pub(crate) struct Function {
     pub(crate) base: hipFunction_t,
     pub(crate) sm_version: u32,
     pub(crate) explicit_args_size_align: Option<Vec<FunctionArgInfo>>,
+    // The module symbol this was created from, kept for launch-timing output.
+    pub(crate) name: String,
 }
 
 impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUfunction, E>
@@ -85,8 +88,7 @@ pub(crate) fn launch_kernel(
     stream: hipStream_t,
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
-) -> hipError_t {
-    // The `extra` form packs every argument into one buffer and describes it
+) -> hipError_t {    // The `extra` form packs every argument into one buffer and describes it
     // with a marker list, instead of passing an array of pointers. CUDA and HIP
     // agree on the markers -- BUFFER_POINTER is 1 and BUFFER_SIZE is 2 in both
     // -- but not on the terminator: CUDA ends the list with a null pointer,
@@ -125,6 +127,21 @@ pub(crate) fn launch_kernel(
         translated[count] = 0x03 as *mut ::core::ffi::c_void;
         translated.as_mut_ptr()
     };
+    if launch_timing_enabled() {
+        return unsafe { timed_launch(
+            f,
+            grid_dim_x,
+            grid_dim_y,
+            grid_dim_z,
+            block_dim_x,
+            block_dim_y,
+            block_dim_z,
+            shared_mem_bytes,
+            stream,
+            kernel_params,
+            extra,
+        ) };
+    }
     unsafe {
         hipModuleLaunchKernel(
             f.base,
@@ -140,6 +157,110 @@ pub(crate) fn launch_kernel(
             extra,
         )
     }
+}
+
+// ZLUDA_LAUNCH_TIMING=1: bracket every launch with an event pair on the same
+// stream and report the GPU duration of the kernel alone. A diagnostic for
+// workloads where a frame's time is spread over many small launches and the
+// question is which kernel eats it: this answers per kernel, at the cost of a
+// host round trip per launch (the events sync before the elapsed time is
+// read), which is why it is off unless asked for.
+//
+// One event pair is reused for the whole process: launches on one stream are
+// serialized anyway, so a live start/stop pair is never read while another
+// launch is in flight.
+fn launch_timing_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZLUDA_LAUNCH_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+unsafe fn timed_launch(
+    f: &Function,
+    grid_dim_x: ::core::ffi::c_uint,
+    grid_dim_y: ::core::ffi::c_uint,
+    grid_dim_z: ::core::ffi::c_uint,
+    block_dim_x: ::core::ffi::c_uint,
+    block_dim_y: ::core::ffi::c_uint,
+    block_dim_z: ::core::ffi::c_uint,
+    shared_mem_bytes: ::core::ffi::c_uint,
+    stream: hipStream_t,
+    kernel_params: *mut *mut ::core::ffi::c_void,
+    extra: *mut *mut ::core::ffi::c_void,
+) -> hipError_t {
+    use std::sync::OnceLock;
+    // Raw HIP handles are not Send/Sync by their type, but the event pair is
+    // only ever touched from the thread that created it after one-time
+    // initialization; wrap it so the static can hold it.
+    struct EventPair(hipEvent_t, hipEvent_t);
+    unsafe impl Send for EventPair {}
+    unsafe impl Sync for EventPair {}
+    static EVENTS: OnceLock<EventPair> = OnceLock::new();
+    let &EventPair(start, stop) = EVENTS.get_or_init(|| {
+        let mut start: hipEvent_t = std::ptr::null_mut();
+        let mut stop: hipEvent_t = std::ptr::null_mut();
+        if hipEventCreateWithFlags(&mut start, 0) != hipError_t::Success {
+            return EventPair(std::ptr::null_mut(), std::ptr::null_mut());
+        }
+        if hipEventCreateWithFlags(&mut stop, 0) != hipError_t::Success {
+            return EventPair(start, std::ptr::null_mut());
+        }
+        EventPair(start, stop)
+    });
+    if start.is_null() || stop.is_null() {
+        // Events unavailable: fall through to a plain launch rather than
+        // failing the application over a diagnostic.
+        return hipModuleLaunchKernel(
+            f.base,
+            grid_dim_x,
+            grid_dim_y,
+            grid_dim_z,
+            block_dim_x,
+            block_dim_y,
+            block_dim_z,
+            shared_mem_bytes,
+            stream,
+            kernel_params,
+            extra,
+        );
+    }
+    hipEventRecord(start, stream);
+    let result = hipModuleLaunchKernel(
+        f.base,
+        grid_dim_x,
+        grid_dim_y,
+        grid_dim_z,
+        block_dim_x,
+        block_dim_y,
+        block_dim_z,
+        shared_mem_bytes,
+        stream,
+        kernel_params,
+        extra,
+    );
+    hipEventRecord(stop, stream);
+    hipEventSynchronize(stop);
+    let mut ms = 0f32;
+    if hipEventElapsedTime(&mut ms, start, stop) == hipError_t::Success && result == hipError_t::Success {
+        let _ = writeln!(
+            std::io::stderr(),
+            "[zluda-launch] {} f={:p} grid={}x{}x{} block={}x{}x{} gpu_ms={:.3}",
+            f.name,
+            f.base.0,
+            grid_dim_x,
+            grid_dim_y,
+            grid_dim_z,
+            block_dim_x,
+            block_dim_y,
+            block_dim_z,
+            ms
+        );
+    }
+    result
 }
 
 pub(crate) unsafe fn set_attribute(

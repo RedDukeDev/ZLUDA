@@ -68,9 +68,11 @@ pub(crate) fn run<'input>(
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
     fp_mode: FloatingPointMode,
     cumode: bool,
+    ignore_maxnreg: bool,
+    num_vgpr_override: Option<u32>,
 ) -> Result<llvm::Module, TranslateError> {
     let module = llvm::Module::new(context, LLVM_UNNAMED);
-    let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode, cumode);
+    let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode, cumode, ignore_maxnreg, num_vgpr_override);
     for directive in directives {
         match directive {
             Directive2::Variable(linking, variable) => emit_ctx.emit_global(linking, variable)?,
@@ -93,6 +95,8 @@ struct ModuleEmitContext<'a, 'input> {
     resolver: ResolveIdent,
     fp_mode: FloatingPointMode,
     cumode: bool,
+    ignore_maxnreg: bool,
+    num_vgpr_override: Option<u32>,
 }
 
 impl<'a, 'input> ModuleEmitContext<'a, 'input> {
@@ -102,6 +106,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         id_defs: &'a GlobalStringIdentResolver2<'input>,
         fp_mode: FloatingPointMode,
         cumode: bool,
+        ignore_maxnreg: bool,
+        num_vgpr_override: Option<u32>,
     ) -> Self {
         ModuleEmitContext {
             context: context.get(),
@@ -111,6 +117,8 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             resolver: ResolveIdent::new(&id_defs),
             fp_mode,
             cumode,
+            ignore_maxnreg,
+            num_vgpr_override,
         }
     }
 
@@ -151,6 +159,22 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         }
         self.emit_target_features(fn_);
         self.emit_tuning(fn_, &method.tuning);
+        // ZLUDA_NUM_VGPR=<n>: force the per-function VGPR budget instead of
+        // letting the occupancy heuristic size it. An application that ships
+        // register-hungry kernels with tiny grids pays nothing for the lost
+        // occupancy and gains the registers the optimiser wanted before it
+        // started spilling into scratch memory.
+        if let Some(vgprs) = self.num_vgpr_override {
+            let value = format!("{vgprs}");
+            self.emit_fn_attribute_string(fn_, "amdgpu-num-vgpr", &value);
+            // The VGPR budget the scheduler allocates against is derived from
+            // its occupancy target, and amdgpu-num-vgpr alone only raises the
+            // ceiling, not the target -- the register allocator kept spilling
+            // at the default 8-waves-per-EU budget. Lowering the *minimum*
+            // occupancy to one wave lets the budget grow to the ceiling while
+            // still permitting the scheduler to aim higher.
+            self.emit_fn_attribute_string(fn_, "amdgpu-waves-per-eu", "1");
+        }
         if let Some(kernel_attrs) = &method.kernel_attributes {
             self.emit_fn_attribute_string(
                 fn_,
@@ -369,6 +393,14 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 // PTX are noreturn in LLVM already
                 ptx_parser::TuningDirective::NoReturn => {}
                 ptx_parser::TuningDirective::MaxNReg(regs) => {
+                    // ZLUDA_IGNORE_MAXNREG=1: the directive was sized by the
+                    // application for NVIDIA's register file; enforcing it on
+                    // AMD can force the optimiser to spill working registers
+                    // into scratch memory. Dropping it changes the code, so
+                    // the flag is part of the cache key (see ExtraCacheAttributes).
+                    if self.ignore_maxnreg {
+                        continue;
+                    }
                     let value = format!("{regs}");
                     self.emit_fn_attribute_string(fn_, "amdgpu-num-vgpr", &value);
                 }
@@ -2217,23 +2249,45 @@ impl<'a> MethodEmitContext<'a> {
         data: ptx_parser::CvtDetails,
         arguments: ptx_parser::CvtArgs<SpirvWord>,
     ) -> Result<(), TranslateError> {
-        // Truncating conversions to FP8 types should be replaced by a function call.
         match data {
             ptx_parser::CvtDetails {
-                to: ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2,
-                mode: ast::CvtMode::FPTruncate { .. },
+                from: from @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
+                to: ast::ScalarType::F16x2,
                 ..
-            } => return Err(error_unreachable()),
-            _ => {}
-        }
-
-        // Extending conversions from FP8 types should be replaced by a function call.
-        match data {
+            } => {
+                return if from == ast::ScalarType::E4m3x2 {
+                    self.emit_cvt_e4m3x2_to_f16x2(arguments)
+                } else {
+                    self.emit_cvt_e5m2x2_to_f16x2(arguments)
+                };
+            }
             ptx_parser::CvtDetails {
-                from: ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2,
-                mode: ast::CvtMode::FPExtend { .. },
-                ..
-            } => return Err(error_unreachable()),
+                from,
+                to: to @ (ast::ScalarType::E4m3x2 | ast::ScalarType::E5m2x2),
+                mode,
+            } => {
+                let relu = match mode {
+                    ast::CvtMode::FPTruncate { relu, .. } => relu,
+                    _ => false,
+                };
+                match from {
+                    ast::ScalarType::F16x2 => {
+                        return if to == ast::ScalarType::E4m3x2 {
+                            self.emit_cvt_f16x2_to_e4m3x2(arguments, relu)
+                        } else {
+                            self.emit_cvt_f16x2_to_e5m2x2(arguments, relu)
+                        };
+                    }
+                    ast::ScalarType::F32 => {
+                        return if to == ast::ScalarType::E4m3x2 {
+                            self.emit_cvt_f32_to_e4m3x2(arguments, relu)
+                        } else {
+                            self.emit_cvt_f32_to_e5m2x2(arguments, relu)
+                        };
+                    }
+                    _ => return Err(error_unreachable()),
+                }
+            }
             _ => {}
         }
 
@@ -2411,6 +2465,964 @@ impl<'a> MethodEmitContext<'a> {
             vec![&type_.into()],
             vec![(src, llvm_type), (zero, llvm_type)],
         )
+    }
+
+    fn emit_cvt_f16x2_to_e4m3x2(
+        &mut self,
+        arguments: ptx_parser::CvtArgs<SpirvWord>,
+        relu: bool,
+    ) -> Result<(), TranslateError> {
+        let src = self.resolver.value(arguments.src)?;
+        self.emit_cvt_f16x2_to_e4m3x2_impl(src, arguments.dst, relu)
+    }
+
+    fn emit_cvt_f16x2_to_e4m3x2_impl(
+        &mut self,
+        mut src: LLVMValueRef,
+        dst: SpirvWord,
+        relu: bool,
+    ) -> Result<(), TranslateError> {
+        if relu {
+            let f16x2_type = get_scalar_type(self.context, ast::ScalarType::F16x2);
+            let zero = self.fp_bound_constant(ast::ScalarType::F16x2, 0.0);
+            let maxnum_intrinsic =
+                format!("llvm.maximumnum.{}\0", LLVMTypeDisplay(ast::ScalarType::F16x2));
+            src = self.emit_intrinsic(
+                unsafe { CStr::from_bytes_with_nul_unchecked(maxnum_intrinsic.as_bytes()) },
+                None,
+                vec![&ast::ScalarType::F16x2.into()],
+                vec![(src, f16x2_type), (zero, f16x2_type)],
+            )?;
+        }
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let i16_type = unsafe { LLVMInt16TypeInContext(self.context) };
+        let half_type = unsafe { LLVMHalfTypeInContext(self.context) };
+        let f16x2_type = unsafe { LLVMVectorType(half_type, 2) };
+
+        let bits =
+            unsafe { LLVMBuildBitCast(self.builder, src, i32_type, LLVM_UNNAMED.as_ptr()) };
+
+        let c_7fff7fff = unsafe { LLVMConstInt(i32_type, 0x7FFF7FFF, 0) };
+        let magnitude =
+            unsafe { LLVMBuildAnd(self.builder, bits, c_7fff7fff, LLVM_UNNAMED.as_ptr()) };
+
+        let c_04000400 = unsafe { LLVMConstInt(i32_type, 0x04000400, 0) };
+        let c_80008000 = unsafe { LLVMConstInt(i32_type, 0x80008000, 0) };
+        let mag_plus_special =
+            unsafe { LLVMBuildAdd(self.builder, magnitude, c_04000400, LLVM_UNNAMED.as_ptr()) };
+        let is_special = unsafe {
+            LLVMBuildAnd(
+                self.builder,
+                mag_plus_special,
+                c_80008000,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+
+        let mag =
+            unsafe { LLVMBuildBitCast(self.builder, magnitude, f16x2_type, LLVM_UNNAMED.as_ptr()) };
+
+        let c_2_pow_minus_8 = self.fp_bound_constant(ast::ScalarType::F16x2, 0.00390625);
+        let scaled_f16x2 = unsafe {
+            LLVMBuildFMul(
+                self.builder,
+                mag,
+                c_2_pow_minus_8,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let scaled = unsafe {
+            LLVMBuildBitCast(self.builder, scaled_f16x2, i32_type, LLVM_UNNAMED.as_ptr())
+        };
+
+        let c_003f003f = unsafe { LLVMConstInt(i32_type, 0x003F003F, 0) };
+        let c_7 = unsafe { LLVMConstInt(i32_type, 7, 0) };
+        let c_00010001 = unsafe { LLVMConstInt(i32_type, 0x00010001, 0) };
+        let scaled_shr_7 =
+            unsafe { LLVMBuildLShr(self.builder, scaled, c_7, LLVM_UNNAMED.as_ptr()) };
+        let scaled_lsb = unsafe {
+            LLVMBuildAnd(
+                self.builder,
+                scaled_shr_7,
+                c_00010001,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let scaled_plus_bias = unsafe {
+            LLVMBuildAdd(
+                self.builder,
+                scaled,
+                c_003f003f,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let rounded = unsafe {
+            LLVMBuildAdd(
+                self.builder,
+                scaled_plus_bias,
+                scaled_lsb,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+
+        let c_two = self.fp_bound_constant(ast::ScalarType::F16x2, 2.0);
+        let c_512 = self.fp_bound_constant(ast::ScalarType::F16x2, 512.0);
+        let mag_plus_two =
+            unsafe { LLVMBuildFAdd(self.builder, mag, c_two, LLVM_UNNAMED.as_ptr()) };
+        let mag_minus_two =
+            unsafe { LLVMBuildFSub(self.builder, mag_plus_two, c_two, LLVM_UNNAMED.as_ptr()) };
+        let stepped =
+            unsafe { LLVMBuildFMul(self.builder, mag_minus_two, c_512, LLVM_UNNAMED.as_ptr()) };
+
+        let c_zero = unsafe { LLVMConstInt(i32_type, 0, 0) };
+        let c_one = unsafe { LLVMConstInt(i32_type, 1, 0) };
+        let stepped_x = unsafe {
+            LLVMBuildExtractElement(self.builder, stepped, c_zero, LLVM_UNNAMED.as_ptr())
+        };
+        let stepped_y = unsafe {
+            LLVMBuildExtractElement(self.builder, stepped, c_one, LLVM_UNNAMED.as_ptr())
+        };
+        let stepped_x_u32 = unsafe {
+            LLVMBuildFPToUI(self.builder, stepped_x, i32_type, LLVM_UNNAMED.as_ptr())
+        };
+        let stepped_y_u32 = unsafe {
+            LLVMBuildFPToUI(self.builder, stepped_y, i32_type, LLVM_UNNAMED.as_ptr())
+        };
+
+        let c_ffff = unsafe { LLVMConstInt(i32_type, 0xFFFF, 0) };
+        let c_2400 = unsafe { LLVMConstInt(i32_type, 0x2400, 0) };
+        let c_16 = unsafe { LLVMConstInt(i32_type, 16, 0) };
+        let c_23 = unsafe { LLVMConstInt(i32_type, 23, 0) };
+        let mag_low =
+            unsafe { LLVMBuildAnd(self.builder, magnitude, c_ffff, LLVM_UNNAMED.as_ptr()) };
+        let mag_high =
+            unsafe { LLVMBuildLShr(self.builder, magnitude, c_16, LLVM_UNNAMED.as_ptr()) };
+
+        let cond_low_denorm = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntULT,
+                mag_low,
+                c_2400,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let rounded_low = unsafe {
+            let rounded_and_ffff =
+                LLVMBuildAnd(self.builder, rounded, c_ffff, LLVM_UNNAMED.as_ptr());
+            LLVMBuildLShr(self.builder, rounded_and_ffff, c_7, LLVM_UNNAMED.as_ptr())
+        };
+        let mut low = unsafe {
+            LLVMBuildSelect(
+                self.builder,
+                cond_low_denorm,
+                stepped_x_u32,
+                rounded_low,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+
+        let cond_high_denorm = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntULT,
+                mag_high,
+                c_2400,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let rounded_high =
+            unsafe { LLVMBuildLShr(self.builder, rounded, c_23, LLVM_UNNAMED.as_ptr()) };
+        let mut high = unsafe {
+            LLVMBuildSelect(
+                self.builder,
+                cond_high_denorm,
+                stepped_y_u32,
+                rounded_high,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+
+        let c_7e = unsafe { LLVMConstInt(i32_type, 0x7E, 0) };
+        let cond_low_sat = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntUGT,
+                low,
+                c_7e,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        low = unsafe {
+            LLVMBuildSelect(self.builder, cond_low_sat, c_7e, low, LLVM_UNNAMED.as_ptr())
+        };
+
+        let cond_high_sat = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntUGT,
+                high,
+                c_7e,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        high = unsafe {
+            LLVMBuildSelect(self.builder, cond_high_sat, c_7e, high, LLVM_UNNAMED.as_ptr())
+        };
+
+        let c_7f = unsafe { LLVMConstInt(i32_type, 0x7F, 0) };
+        let c_8000 = unsafe { LLVMConstInt(i32_type, 0x00008000, 0) };
+        let is_special_low =
+            unsafe { LLVMBuildAnd(self.builder, is_special, c_8000, LLVM_UNNAMED.as_ptr()) };
+        let cond_special_low = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntNE,
+                is_special_low,
+                c_zero,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        low = unsafe {
+            LLVMBuildSelect(
+                self.builder,
+                cond_special_low,
+                c_7f,
+                low,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+
+        let c_80000000 = unsafe { LLVMConstInt(i32_type, 0x80000000, 0) };
+        let is_special_high =
+            unsafe { LLVMBuildAnd(self.builder, is_special, c_80000000, LLVM_UNNAMED.as_ptr()) };
+        let cond_special_high = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntNE,
+                is_special_high,
+                c_zero,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        high = unsafe {
+            LLVMBuildSelect(
+                self.builder,
+                cond_special_high,
+                c_7f,
+                high,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+
+        let c_8 = unsafe { LLVMConstInt(i32_type, 8, 0) };
+        let c_24 = unsafe { LLVMConstInt(i32_type, 24, 0) };
+        let c_80 = unsafe { LLVMConstInt(i32_type, 0x80, 0) };
+        let sign_low = unsafe {
+            let s = LLVMBuildLShr(self.builder, bits, c_8, LLVM_UNNAMED.as_ptr());
+            LLVMBuildAnd(self.builder, s, c_80, LLVM_UNNAMED.as_ptr())
+        };
+        let sign_high = unsafe {
+            let s = LLVMBuildLShr(self.builder, bits, c_24, LLVM_UNNAMED.as_ptr());
+            LLVMBuildAnd(self.builder, s, c_80, LLVM_UNNAMED.as_ptr())
+        };
+        low = unsafe { LLVMBuildOr(self.builder, low, sign_low, LLVM_UNNAMED.as_ptr()) };
+        high = unsafe { LLVMBuildOr(self.builder, high, sign_high, LLVM_UNNAMED.as_ptr()) };
+
+        let high_shl_8 =
+            unsafe { LLVMBuildShl(self.builder, high, c_8, LLVM_UNNAMED.as_ptr()) };
+        let packed_u32 =
+            unsafe { LLVMBuildOr(self.builder, low, high_shl_8, LLVM_UNNAMED.as_ptr()) };
+        self.resolver.with_result(dst, |dst_val| unsafe {
+            LLVMBuildTrunc(self.builder, packed_u32, i16_type, dst_val)
+        });
+        Ok(())
+    }
+
+    // A f32 source must not go through f16 on its way to fp8: both roundings
+    // are to-nearest-even, and the first one can move the value onto an exact
+    // tie of the second, which then rounds the other way from what a single
+    // rounding of the original would produce (1.1875 - 2^-16 lands on 1.25
+    // through f16 and on 1.125 directly). This is one RNE from the f32 bits
+    // instead: exponent and 24-bit significand decomposed, the 20 dropped
+    // bits rounded with their lowest surviving bit as the tie breaker, and
+    // the e4m3 denormal grid (multiples of 2^-9) reached by a variable extra
+    // shift below f16's minimum normal. NaN and infinities become the fp8
+    // NaN pattern with the sign kept, matching the f16x2 source path; values
+    // past the maximum finite clamp to it (.satfinite).
+    fn emit_cvt_f32_to_e4m3_scalar(
+        &mut self,
+        src: LLVMValueRef,
+        relu: bool,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let f32_type = unsafe { LLVMFloatTypeInContext(self.context) };
+
+        let mut src = src;
+        if relu {
+            let zero = self.fp_bound_constant(ast::ScalarType::F32, 0.0);
+            let maxnum_intrinsic =
+                format!("llvm.maximumnum.{}\0", LLVMTypeDisplay(ast::ScalarType::F32));
+            src = self.emit_intrinsic(
+                unsafe { CStr::from_bytes_with_nul_unchecked(maxnum_intrinsic.as_bytes()) },
+                None,
+                vec![&ast::ScalarType::F32.into()],
+                vec![(src, f32_type), (zero, f32_type)],
+            )?;
+        }
+
+        let bits = unsafe { LLVMBuildBitCast(self.builder, src, i32_type, LLVM_UNNAMED.as_ptr()) };
+        let sign = unsafe {
+            LLVMBuildAnd(self.builder, bits, LLVMConstInt(i32_type, 0x80000000, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let sign_byte = unsafe {
+            let shifted = LLVMBuildLShr(
+                self.builder,
+                sign,
+                LLVMConstInt(i32_type, 24, 0),
+                LLVM_UNNAMED.as_ptr(),
+            );
+            LLVMBuildAnd(self.builder, shifted, LLVMConstInt(i32_type, 0x80, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let magnitude = unsafe {
+            LLVMBuildAnd(self.builder, bits, LLVMConstInt(i32_type, 0x7FFFFFFF, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let Ef = unsafe {
+            LLVMBuildLShr(self.builder, magnitude, LLVMConstInt(i32_type, 23, 0), LLVM_UNNAMED.as_ptr())
+        };
+
+        let is_special = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, Ef, LLVMConstInt(i32_type, 255, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let is_f32_denorm = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, Ef, LLVMConstInt(i32_type, 0, 0), LLVM_UNNAMED.as_ptr())
+        };
+
+        let mant23 = unsafe {
+            LLVMBuildAnd(self.builder, magnitude, LLVMConstInt(i32_type, 0x7FFFFF, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let hidden = unsafe {
+            LLVMBuildSelect(self.builder, is_f32_denorm, LLVMConstInt(i32_type, 0, 0), LLVMConstInt(i32_type, 0x800000, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let significand = unsafe { LLVMBuildOr(self.builder, mant23, hidden, LLVM_UNNAMED.as_ptr()) };
+        let biased_e = unsafe {
+            LLVMBuildSub(self.builder, Ef, LLVMConstInt(i32_type, 127, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let e = unsafe {
+            LLVMBuildSelect(self.builder, is_f32_denorm, LLVMConstInt(i32_type, -126i64 as u64, 0), biased_e, LLVM_UNNAMED.as_ptr())
+        };
+
+        // Normal e4m3 results (e4m3 exponent field >= 1, source exponent
+        // >= -6): round the 20 dropped significand bits, ties resolved by
+        // the lowest bit that survives.
+        let dropped = unsafe {
+            LLVMBuildAnd(self.builder, significand, LLVMConstInt(i32_type, 0xFFFFF, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let half = unsafe { LLVMConstInt(i32_type, 0x80000, 0) };
+        let mant4 = unsafe {
+            LLVMBuildLShr(self.builder, significand, LLVMConstInt(i32_type, 20, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let round_up_norm = unsafe {
+            let gt = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntUGT, dropped, half, LLVM_UNNAMED.as_ptr());
+            let eq = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, dropped, half, LLVM_UNNAMED.as_ptr());
+            let lsb = LLVMBuildAnd(self.builder, mant4, LLVMConstInt(i32_type, 1, 0), LLVM_UNNAMED.as_ptr());
+            let lsb_set = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntNE, lsb, LLVMConstInt(i32_type, 0, 0), LLVM_UNNAMED.as_ptr());
+            let tie_up = LLVMBuildAnd(self.builder, eq, lsb_set, LLVM_UNNAMED.as_ptr());
+            LLVMBuildOr(self.builder, gt, tie_up, LLVM_UNNAMED.as_ptr())
+        };
+        let mant4_rounded = unsafe {
+            LLVMBuildAdd(self.builder, mant4, LLVMBuildZExt(self.builder, round_up_norm, i32_type, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr())
+        };
+        // A rounding carry into the exponent lands on the next binade's
+        // minimum mantissa (1000b); past exponent 15 there is no next finite.
+        let carry = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, mant4_rounded, LLVMConstInt(i32_type, 16, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let mant4_final = unsafe {
+            LLVMBuildSelect(self.builder, carry, LLVMConstInt(i32_type, 8, 0), mant4_rounded, LLVM_UNNAMED.as_ptr())
+        };
+        let e_norm = unsafe {
+            LLVMBuildAdd(self.builder, e, LLVMBuildZExt(self.builder, carry, i32_type, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr())
+        };
+        let E4 = unsafe {
+            LLVMBuildAdd(self.builder, e_norm, LLVMConstInt(i32_type, 7, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let overflow = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntUGE, E4, LLVMConstInt(i32_type, 16, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let mant_field = unsafe {
+            LLVMBuildSub(self.builder, mant4_final, LLVMConstInt(i32_type, 8, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let exp_field = unsafe {
+            LLVMBuildShl(self.builder, E4, LLVMConstInt(i32_type, 3, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let norm_bits = unsafe { LLVMBuildOr(self.builder, exp_field, mant_field, LLVM_UNNAMED.as_ptr()) };
+        let norm_res = unsafe {
+            LLVMBuildSelect(self.builder, overflow, LLVMConstInt(i32_type, 0x7E, 0), norm_bits, LLVM_UNNAMED.as_ptr())
+        };
+
+        // e4m3 denormals sit below f16's minimum normal on a 2^-9 grid: the
+        // significand shifts right by 14 - e (clamped at 30; past the clamp
+        // the value is provably below half a grid step and rounds to zero),
+        // and the grid index is that shifted value itself.
+        let d_full = unsafe {
+            LLVMBuildSub(self.builder, LLVMConstInt(i32_type, 14, 0), e, LLVM_UNNAMED.as_ptr())
+        };
+        let d_past_clamp = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntSGT, d_full, LLVMConstInt(i32_type, 30, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let d = unsafe {
+            LLVMBuildSelect(self.builder, d_past_clamp, LLVMConstInt(i32_type, 30, 0), d_full, LLVM_UNNAMED.as_ptr())
+        };
+        let denorm_mask = unsafe {
+            let one_up = LLVMBuildShl(self.builder, LLVMConstInt(i32_type, 1, 0), d, LLVM_UNNAMED.as_ptr());
+            LLVMBuildSub(self.builder, one_up, LLVMConstInt(i32_type, 1, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let dropped_denorm = unsafe {
+            LLVMBuildAnd(self.builder, significand, denorm_mask, LLVM_UNNAMED.as_ptr())
+        };
+        let half_denorm = unsafe {
+            LLVMBuildLShr(self.builder, denorm_mask, LLVMConstInt(i32_type, 1, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let k = unsafe {
+            LLVMBuildLShr(self.builder, significand, d, LLVM_UNNAMED.as_ptr())
+        };
+        let round_up_denorm = unsafe {
+            let gt = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntUGT, dropped_denorm, half_denorm, LLVM_UNNAMED.as_ptr());
+            let eq = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, dropped_denorm, half_denorm, LLVM_UNNAMED.as_ptr());
+            let lsb = LLVMBuildAnd(self.builder, k, LLVMConstInt(i32_type, 1, 0), LLVM_UNNAMED.as_ptr());
+            let lsb_set = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntNE, lsb, LLVMConstInt(i32_type, 0, 0), LLVM_UNNAMED.as_ptr());
+            let tie_up = LLVMBuildAnd(self.builder, eq, lsb_set, LLVM_UNNAMED.as_ptr());
+            // Past the clamp every value is below half a grid step.
+            let up = LLVMBuildAnd(self.builder, tie_up, LLVMBuildNot(self.builder, d_past_clamp, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr());
+            LLVMBuildOr(self.builder, gt, up, LLVM_UNNAMED.as_ptr())
+        };
+        let k_rounded = unsafe {
+            LLVMBuildAdd(self.builder, k, LLVMBuildZExt(self.builder, round_up_denorm, i32_type, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr())
+        };
+        let denorm_res = unsafe {
+            LLVMBuildSelect(self.builder,
+                LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntUGT, k_rounded, LLVMConstInt(i32_type, 7, 0), LLVM_UNNAMED.as_ptr()),
+                LLVMConstInt(i32_type, 7, 0),
+                k_rounded,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+
+        let is_normal = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntSGE, e, LLVMConstInt(i32_type, -6i64 as u64, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let magnitude_res = unsafe {
+            LLVMBuildSelect(self.builder, is_normal, norm_res, denorm_res, LLVM_UNNAMED.as_ptr())
+        };
+        let magnitude_signed = unsafe {
+            LLVMBuildOr(self.builder, magnitude_res, sign_byte, LLVM_UNNAMED.as_ptr())
+        };
+        let special_res = unsafe {
+            LLVMBuildOr(self.builder, sign_byte, LLVMConstInt(i32_type, 0x7F, 0), LLVM_UNNAMED.as_ptr())
+        };
+        Ok(unsafe {
+            LLVMBuildSelect(self.builder, is_special, special_res, magnitude_signed, LLVM_UNNAMED.as_ptr())
+        })
+    }
+
+    fn emit_cvt_f32_to_e4m3x2(
+        &mut self,
+        arguments: ptx_parser::CvtArgs<SpirvWord>,
+        relu: bool,
+    ) -> Result<(), TranslateError> {
+        let src_a = self.resolver.value(arguments.src)?;
+        let src2 = arguments.src2.ok_or_else(|| error_unreachable())?;
+        let src_b = self.resolver.value(src2)?;
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let i16_type = unsafe { LLVMInt16TypeInContext(self.context) };
+
+        // Destination layout matches the f16x2 source path: first source in
+        // the low byte, second in the high byte.
+        let b_res = self.emit_cvt_f32_to_e4m3_scalar(src_b, relu)?;
+        let a_res = self.emit_cvt_f32_to_e4m3_scalar(src_a, relu)?;
+        let a_high = unsafe {
+            LLVMBuildShl(self.builder, a_res, LLVMConstInt(i32_type, 8, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let packed = unsafe { LLVMBuildOr(self.builder, b_res, a_high, LLVM_UNNAMED.as_ptr()) };
+        self.resolver.with_result(arguments.dst, |dst_val| unsafe {
+            LLVMBuildTrunc(self.builder, packed, i16_type, dst_val)
+        });
+        Ok(())
+    }
+
+    fn emit_cvt_e4m3x2_to_f16x2(
+        &mut self,
+        arguments: ptx_parser::CvtArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let src = self.resolver.value(arguments.src)?;
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let half_type = unsafe { LLVMHalfTypeInContext(self.context) };
+        let f16x2_type = unsafe { LLVMVectorType(half_type, 2) };
+
+        let two = unsafe { LLVMBuildZExt(self.builder, src, i32_type, LLVM_UNNAMED.as_ptr()) };
+
+        let c_ff = unsafe { LLVMConstInt(i32_type, 0xFF, 0) };
+        let c_ff00 = unsafe { LLVMConstInt(i32_type, 0xFF00, 0) };
+        let c_8 = unsafe { LLVMConstInt(i32_type, 8, 0) };
+        let x_low = unsafe { LLVMBuildAnd(self.builder, two, c_ff, LLVM_UNNAMED.as_ptr()) };
+        let x_high = unsafe {
+            let h = LLVMBuildAnd(self.builder, two, c_ff00, LLVM_UNNAMED.as_ptr());
+            LLVMBuildShl(self.builder, h, c_8, LLVM_UNNAMED.as_ptr())
+        };
+        let x = unsafe { LLVMBuildOr(self.builder, x_low, x_high, LLVM_UNNAMED.as_ptr()) };
+
+        let c_00800080 = unsafe { LLVMConstInt(i32_type, 0x00800080, 0) };
+        let sign = unsafe {
+            let s = LLVMBuildAnd(self.builder, x, c_00800080, LLVM_UNNAMED.as_ptr());
+            LLVMBuildShl(self.builder, s, c_8, LLVM_UNNAMED.as_ptr())
+        };
+
+        let c_007f007f = unsafe { LLVMConstInt(i32_type, 0x007F007F, 0) };
+        let c_7 = unsafe { LLVMConstInt(i32_type, 7, 0) };
+        let magnitude = unsafe {
+            let m = LLVMBuildAnd(self.builder, x, c_007f007f, LLVM_UNNAMED.as_ptr());
+            LLVMBuildShl(self.builder, m, c_7, LLVM_UNNAMED.as_ptr())
+        };
+
+        let c_00010001 = unsafe { LLVMConstInt(i32_type, 0x00010001, 0) };
+        let is_nan = unsafe {
+            let m = LLVMBuildAnd(self.builder, x, c_007f007f, LLVM_UNNAMED.as_ptr());
+            let sum = LLVMBuildAdd(self.builder, m, c_00010001, LLVM_UNNAMED.as_ptr());
+            LLVMBuildAnd(self.builder, sum, c_00800080, LLVM_UNNAMED.as_ptr())
+        };
+
+        let c_ffff = unsafe { LLVMConstInt(i32_type, 0xFFFF, 0) };
+        let nan_mask = unsafe {
+            let shifted = LLVMBuildLShr(self.builder, is_nan, c_7, LLVM_UNNAMED.as_ptr());
+            LLVMBuildMul(self.builder, shifted, c_ffff, LLVM_UNNAMED.as_ptr())
+        };
+
+        let mag_f16x2 = unsafe {
+            LLVMBuildBitCast(self.builder, magnitude, f16x2_type, LLVM_UNNAMED.as_ptr())
+        };
+        let c_256 = self.fp_bound_constant(ast::ScalarType::F16x2, 256.0);
+        let scaled =
+            unsafe { LLVMBuildFMul(self.builder, mag_f16x2, c_256, LLVM_UNNAMED.as_ptr()) };
+        let scaled_bits =
+            unsafe { LLVMBuildBitCast(self.builder, scaled, i32_type, LLVM_UNNAMED.as_ptr()) };
+
+        let not_nan_mask =
+            unsafe { LLVMBuildNot(self.builder, nan_mask, LLVM_UNNAMED.as_ptr()) };
+        let scaled_masked = unsafe {
+            LLVMBuildAnd(
+                self.builder,
+                scaled_bits,
+                not_nan_mask,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let c_7e007e00 = unsafe { LLVMConstInt(i32_type, 0x7E007E00, 0) };
+        let nan_bits =
+            unsafe { LLVMBuildAnd(self.builder, nan_mask, c_7e007e00, LLVM_UNNAMED.as_ptr()) };
+        let res_part1 =
+            unsafe { LLVMBuildOr(self.builder, sign, scaled_masked, LLVM_UNNAMED.as_ptr()) };
+        let res_i32 =
+            unsafe { LLVMBuildOr(self.builder, res_part1, nan_bits, LLVM_UNNAMED.as_ptr()) };
+
+        self.resolver.with_result(arguments.dst, |dst_val| unsafe {
+            LLVMBuildBitCast(self.builder, res_i32, f16x2_type, dst_val)
+        });
+        Ok(())
+    }
+
+    fn emit_cvt_f16x2_to_e5m2x2(
+        &mut self,
+        arguments: ptx_parser::CvtArgs<SpirvWord>,
+        relu: bool,
+    ) -> Result<(), TranslateError> {
+        let src = self.resolver.value(arguments.src)?;
+        self.emit_cvt_f16x2_to_e5m2x2_impl(src, arguments.dst, relu)
+    }
+
+    fn emit_cvt_f16x2_to_e5m2x2_impl(
+        &mut self,
+        mut src: LLVMValueRef,
+        dst: SpirvWord,
+        relu: bool,
+    ) -> Result<(), TranslateError> {
+        if relu {
+            let f16x2_type = get_scalar_type(self.context, ast::ScalarType::F16x2);
+            let zero = self.fp_bound_constant(ast::ScalarType::F16x2, 0.0);
+            let maxnum_intrinsic =
+                format!("llvm.maximumnum.{}\0", LLVMTypeDisplay(ast::ScalarType::F16x2));
+            src = self.emit_intrinsic(
+                unsafe { CStr::from_bytes_with_nul_unchecked(maxnum_intrinsic.as_bytes()) },
+                None,
+                vec![&ast::ScalarType::F16x2.into()],
+                vec![(src, f16x2_type), (zero, f16x2_type)],
+            )?;
+        }
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let i16_type = unsafe { LLVMInt16TypeInContext(self.context) };
+
+        let bits =
+            unsafe { LLVMBuildBitCast(self.builder, src, i32_type, LLVM_UNNAMED.as_ptr()) };
+        let c_8 = unsafe { LLVMConstInt(i32_type, 8, 0) };
+        let c_16 = unsafe { LLVMConstInt(i32_type, 16, 0) };
+        let c_00800080 = unsafe { LLVMConstInt(i32_type, 0x00800080, 0) };
+        let c_7fff7fff = unsafe { LLVMConstInt(i32_type, 0x7FFF7FFF, 0) };
+        let c_007f007f = unsafe { LLVMConstInt(i32_type, 0x007F007F, 0) };
+        let c_00010001 = unsafe { LLVMConstInt(i32_type, 0x00010001, 0) };
+        let c_ffff = unsafe { LLVMConstInt(i32_type, 0xFFFF, 0) };
+        let c_ff = unsafe { LLVMConstInt(i32_type, 0xFF, 0) };
+        let c_7b = unsafe { LLVMConstInt(i32_type, 0x7B, 0) };
+        let c_7c00 = unsafe { LLVMConstInt(i32_type, 0x7C00, 0) };
+        let c_7f = unsafe { LLVMConstInt(i32_type, 0x7F, 0) };
+        let c_80 = unsafe { LLVMConstInt(i32_type, 0x80, 0) };
+
+        let sign = unsafe {
+            let s = LLVMBuildLShr(self.builder, bits, c_8, LLVM_UNNAMED.as_ptr());
+            LLVMBuildAnd(self.builder, s, c_00800080, LLVM_UNNAMED.as_ptr())
+        };
+        let mag =
+            unsafe { LLVMBuildAnd(self.builder, bits, c_7fff7fff, LLVM_UNNAMED.as_ptr()) };
+
+        let round_bias = unsafe {
+            let mag_shr = LLVMBuildLShr(self.builder, mag, c_8, LLVM_UNNAMED.as_ptr());
+            let lsb = LLVMBuildAnd(self.builder, mag_shr, c_00010001, LLVM_UNNAMED.as_ptr());
+            LLVMBuildAdd(self.builder, c_007f007f, lsb, LLVM_UNNAMED.as_ptr())
+        };
+        let rounded = unsafe {
+            let sum = LLVMBuildAdd(self.builder, mag, round_bias, LLVM_UNNAMED.as_ptr());
+            LLVMBuildLShr(self.builder, sum, c_8, LLVM_UNNAMED.as_ptr())
+        };
+
+        let mag_low =
+            unsafe { LLVMBuildAnd(self.builder, mag, c_ffff, LLVM_UNNAMED.as_ptr()) };
+        let mut val_low =
+            unsafe { LLVMBuildAnd(self.builder, rounded, c_ff, LLVM_UNNAMED.as_ptr()) };
+        let cond_sat_low = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntUGT,
+                val_low,
+                c_7b,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        val_low = unsafe {
+            LLVMBuildSelect(
+                self.builder,
+                cond_sat_low,
+                c_7b,
+                val_low,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let cond_nan_low = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntUGT,
+                mag_low,
+                c_7c00,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        val_low = unsafe {
+            LLVMBuildSelect(
+                self.builder,
+                cond_nan_low,
+                c_7f,
+                val_low,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let sign_low = unsafe { LLVMBuildAnd(self.builder, sign, c_80, LLVM_UNNAMED.as_ptr()) };
+        val_low = unsafe { LLVMBuildOr(self.builder, val_low, sign_low, LLVM_UNNAMED.as_ptr()) };
+
+        let mag_high =
+            unsafe { LLVMBuildLShr(self.builder, mag, c_16, LLVM_UNNAMED.as_ptr()) };
+        let mut val_high = unsafe {
+            let r_shr = LLVMBuildLShr(self.builder, rounded, c_16, LLVM_UNNAMED.as_ptr());
+            LLVMBuildAnd(self.builder, r_shr, c_ff, LLVM_UNNAMED.as_ptr())
+        };
+        let cond_sat_high = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntUGT,
+                val_high,
+                c_7b,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        val_high = unsafe {
+            LLVMBuildSelect(
+                self.builder,
+                cond_sat_high,
+                c_7b,
+                val_high,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let cond_nan_high = unsafe {
+            LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntUGT,
+                mag_high,
+                c_7c00,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        val_high = unsafe {
+            LLVMBuildSelect(
+                self.builder,
+                cond_nan_high,
+                c_7f,
+                val_high,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        let sign_high = unsafe {
+            let s_shr = LLVMBuildLShr(self.builder, sign, c_16, LLVM_UNNAMED.as_ptr());
+            LLVMBuildAnd(self.builder, s_shr, c_80, LLVM_UNNAMED.as_ptr())
+        };
+        val_high =
+            unsafe { LLVMBuildOr(self.builder, val_high, sign_high, LLVM_UNNAMED.as_ptr()) };
+
+        let val_high_shl =
+            unsafe { LLVMBuildShl(self.builder, val_high, c_8, LLVM_UNNAMED.as_ptr()) };
+        let res_u32 =
+            unsafe { LLVMBuildOr(self.builder, val_low, val_high_shl, LLVM_UNNAMED.as_ptr()) };
+        self.resolver.with_result(dst, |dst_val| unsafe {
+            LLVMBuildTrunc(self.builder, res_u32, i16_type, dst_val)
+        });
+        Ok(())
+    }
+
+    // Same shape as the e4m3 f32 path: one RNE from the f32 bits rather than
+    // a double rounding through f16. e5m2 differs in the constants -- two
+    // mantissa bits (21 dropped), bias 15, a 2^-16 denormal grid, and a
+    // representable infinity -- and .satfinite clamps to the maximum finite
+    // (0x7B), while NaN and infinities still map to the NaN pattern.
+    fn emit_cvt_f32_to_e5m2_scalar(
+        &mut self,
+        src: LLVMValueRef,
+        relu: bool,
+    ) -> Result<LLVMValueRef, TranslateError> {
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let f32_type = unsafe { LLVMFloatTypeInContext(self.context) };
+
+        let mut src = src;
+        if relu {
+            let zero = self.fp_bound_constant(ast::ScalarType::F32, 0.0);
+            let maxnum_intrinsic =
+                format!("llvm.maximumnum.{}\0", LLVMTypeDisplay(ast::ScalarType::F32));
+            src = self.emit_intrinsic(
+                unsafe { CStr::from_bytes_with_nul_unchecked(maxnum_intrinsic.as_bytes()) },
+                None,
+                vec![&ast::ScalarType::F32.into()],
+                vec![(src, f32_type), (zero, f32_type)],
+            )?;
+        }
+
+        let bits = unsafe { LLVMBuildBitCast(self.builder, src, i32_type, LLVM_UNNAMED.as_ptr()) };
+        let sign = unsafe {
+            LLVMBuildAnd(self.builder, bits, LLVMConstInt(i32_type, 0x80000000, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let sign_byte = unsafe {
+            let shifted = LLVMBuildLShr(
+                self.builder,
+                sign,
+                LLVMConstInt(i32_type, 24, 0),
+                LLVM_UNNAMED.as_ptr(),
+            );
+            LLVMBuildAnd(self.builder, shifted, LLVMConstInt(i32_type, 0x80, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let magnitude = unsafe {
+            LLVMBuildAnd(self.builder, bits, LLVMConstInt(i32_type, 0x7FFFFFFF, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let Ef = unsafe {
+            LLVMBuildLShr(self.builder, magnitude, LLVMConstInt(i32_type, 23, 0), LLVM_UNNAMED.as_ptr())
+        };
+
+        let is_special = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, Ef, LLVMConstInt(i32_type, 255, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let is_f32_denorm = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, Ef, LLVMConstInt(i32_type, 0, 0), LLVM_UNNAMED.as_ptr())
+        };
+
+        let mant23 = unsafe {
+            LLVMBuildAnd(self.builder, magnitude, LLVMConstInt(i32_type, 0x7FFFFF, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let hidden = unsafe {
+            LLVMBuildSelect(self.builder, is_f32_denorm, LLVMConstInt(i32_type, 0, 0), LLVMConstInt(i32_type, 0x800000, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let significand = unsafe { LLVMBuildOr(self.builder, mant23, hidden, LLVM_UNNAMED.as_ptr()) };
+        let biased_e = unsafe {
+            LLVMBuildSub(self.builder, Ef, LLVMConstInt(i32_type, 127, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let e = unsafe {
+            LLVMBuildSelect(self.builder, is_f32_denorm, LLVMConstInt(i32_type, -126i64 as u64, 0), biased_e, LLVM_UNNAMED.as_ptr())
+        };
+
+        // Normal e5m2 results (e5m2 exponent field >= 1, source exponent
+        // >= -14): 21 dropped significand bits, the same RNE form.
+        let dropped = unsafe {
+            LLVMBuildAnd(self.builder, significand, LLVMConstInt(i32_type, 0x1FFFFF, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let half = unsafe { LLVMConstInt(i32_type, 0x100000, 0) };
+        let mant3 = unsafe {
+            LLVMBuildLShr(self.builder, significand, LLVMConstInt(i32_type, 21, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let round_up_norm = unsafe {
+            let gt = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntUGT, dropped, half, LLVM_UNNAMED.as_ptr());
+            let eq = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, dropped, half, LLVM_UNNAMED.as_ptr());
+            let lsb = LLVMBuildAnd(self.builder, mant3, LLVMConstInt(i32_type, 1, 0), LLVM_UNNAMED.as_ptr());
+            let lsb_set = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntNE, lsb, LLVMConstInt(i32_type, 0, 0), LLVM_UNNAMED.as_ptr());
+            let tie_up = LLVMBuildAnd(self.builder, eq, lsb_set, LLVM_UNNAMED.as_ptr());
+            LLVMBuildOr(self.builder, gt, tie_up, LLVM_UNNAMED.as_ptr())
+        };
+        let mant3_rounded = unsafe {
+            LLVMBuildAdd(self.builder, mant3, LLVMBuildZExt(self.builder, round_up_norm, i32_type, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr())
+        };
+        let carry = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, mant3_rounded, LLVMConstInt(i32_type, 8, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let mant3_final = unsafe {
+            LLVMBuildSelect(self.builder, carry, LLVMConstInt(i32_type, 4, 0), mant3_rounded, LLVM_UNNAMED.as_ptr())
+        };
+        let e_norm = unsafe {
+            LLVMBuildAdd(self.builder, e, LLVMBuildZExt(self.builder, carry, i32_type, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr())
+        };
+        let E5 = unsafe {
+            LLVMBuildAdd(self.builder, e_norm, LLVMConstInt(i32_type, 15, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let overflow = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntUGE, E5, LLVMConstInt(i32_type, 31, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let mant_field = unsafe {
+            LLVMBuildSub(self.builder, mant3_final, LLVMConstInt(i32_type, 4, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let exp_field = unsafe {
+            LLVMBuildShl(self.builder, E5, LLVMConstInt(i32_type, 2, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let norm_bits = unsafe { LLVMBuildOr(self.builder, exp_field, mant_field, LLVM_UNNAMED.as_ptr()) };
+        let norm_res = unsafe {
+            LLVMBuildSelect(self.builder, overflow, LLVMConstInt(i32_type, 0x7B, 0), norm_bits, LLVM_UNNAMED.as_ptr())
+        };
+
+        // e5m2 denormals sit on a 2^-16 grid; same clamped-shift form as the
+        // e4m3 denorm path, with 7 - e as the shift.
+        let d_full = unsafe {
+            LLVMBuildSub(self.builder, LLVMConstInt(i32_type, 7, 0), e, LLVM_UNNAMED.as_ptr())
+        };
+        let d_past_clamp = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntSGT, d_full, LLVMConstInt(i32_type, 30, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let d = unsafe {
+            LLVMBuildSelect(self.builder, d_past_clamp, LLVMConstInt(i32_type, 30, 0), d_full, LLVM_UNNAMED.as_ptr())
+        };
+        let denorm_mask = unsafe {
+            let one_up = LLVMBuildShl(self.builder, LLVMConstInt(i32_type, 1, 0), d, LLVM_UNNAMED.as_ptr());
+            LLVMBuildSub(self.builder, one_up, LLVMConstInt(i32_type, 1, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let dropped_denorm = unsafe {
+            LLVMBuildAnd(self.builder, significand, denorm_mask, LLVM_UNNAMED.as_ptr())
+        };
+        let half_denorm = unsafe {
+            LLVMBuildLShr(self.builder, denorm_mask, LLVMConstInt(i32_type, 1, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let k = unsafe {
+            LLVMBuildLShr(self.builder, significand, d, LLVM_UNNAMED.as_ptr())
+        };
+        let round_up_denorm = unsafe {
+            let gt = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntUGT, dropped_denorm, half_denorm, LLVM_UNNAMED.as_ptr());
+            let eq = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntEQ, dropped_denorm, half_denorm, LLVM_UNNAMED.as_ptr());
+            let lsb = LLVMBuildAnd(self.builder, k, LLVMConstInt(i32_type, 1, 0), LLVM_UNNAMED.as_ptr());
+            let lsb_set = LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntNE, lsb, LLVMConstInt(i32_type, 0, 0), LLVM_UNNAMED.as_ptr());
+            let tie_up = LLVMBuildAnd(self.builder, eq, lsb_set, LLVM_UNNAMED.as_ptr());
+            let up = LLVMBuildAnd(self.builder, tie_up, LLVMBuildNot(self.builder, d_past_clamp, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr());
+            LLVMBuildOr(self.builder, gt, up, LLVM_UNNAMED.as_ptr())
+        };
+        let k_rounded = unsafe {
+            LLVMBuildAdd(self.builder, k, LLVMBuildZExt(self.builder, round_up_denorm, i32_type, LLVM_UNNAMED.as_ptr()), LLVM_UNNAMED.as_ptr())
+        };
+        let denorm_res = unsafe {
+            LLVMBuildSelect(self.builder,
+                LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntUGT, k_rounded, LLVMConstInt(i32_type, 3, 0), LLVM_UNNAMED.as_ptr()),
+                LLVMConstInt(i32_type, 3, 0),
+                k_rounded,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+
+        let is_normal = unsafe {
+            LLVMBuildICmp(self.builder, LLVMIntPredicate::LLVMIntSGE, e, LLVMConstInt(i32_type, -14i64 as u64, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let magnitude_res = unsafe {
+            LLVMBuildSelect(self.builder, is_normal, norm_res, denorm_res, LLVM_UNNAMED.as_ptr())
+        };
+        let magnitude_signed = unsafe {
+            LLVMBuildOr(self.builder, magnitude_res, sign_byte, LLVM_UNNAMED.as_ptr())
+        };
+        let special_res = unsafe {
+            LLVMBuildOr(self.builder, sign_byte, LLVMConstInt(i32_type, 0x7F, 0), LLVM_UNNAMED.as_ptr())
+        };
+        Ok(unsafe {
+            LLVMBuildSelect(self.builder, is_special, special_res, magnitude_signed, LLVM_UNNAMED.as_ptr())
+        })
+    }
+
+    fn emit_cvt_f32_to_e5m2x2(
+        &mut self,
+        arguments: ptx_parser::CvtArgs<SpirvWord>,
+        relu: bool,
+    ) -> Result<(), TranslateError> {
+        let src_a = self.resolver.value(arguments.src)?;
+        let src2 = arguments.src2.ok_or_else(|| error_unreachable())?;
+        let src_b = self.resolver.value(src2)?;
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let i16_type = unsafe { LLVMInt16TypeInContext(self.context) };
+
+        let b_res = self.emit_cvt_f32_to_e5m2_scalar(src_b, relu)?;
+        let a_res = self.emit_cvt_f32_to_e5m2_scalar(src_a, relu)?;
+        let a_high = unsafe {
+            LLVMBuildShl(self.builder, a_res, LLVMConstInt(i32_type, 8, 0), LLVM_UNNAMED.as_ptr())
+        };
+        let packed = unsafe { LLVMBuildOr(self.builder, b_res, a_high, LLVM_UNNAMED.as_ptr()) };
+        self.resolver.with_result(arguments.dst, |dst_val| unsafe {
+            LLVMBuildTrunc(self.builder, packed, i16_type, dst_val)
+        });
+        Ok(())
+    }
+
+    fn emit_cvt_e5m2x2_to_f16x2(
+        &mut self,
+        arguments: ptx_parser::CvtArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let src = self.resolver.value(arguments.src)?;
+        let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };
+        let half_type = unsafe { LLVMHalfTypeInContext(self.context) };
+        let f16x2_type = unsafe { LLVMVectorType(half_type, 2) };
+
+        let src_i32 =
+            unsafe { LLVMBuildZExt(self.builder, src, i32_type, LLVM_UNNAMED.as_ptr()) };
+        let c_ff = unsafe { LLVMConstInt(i32_type, 0xFF, 0) };
+        let c_ff00 = unsafe { LLVMConstInt(i32_type, 0xFF00, 0) };
+        let c_8 = unsafe { LLVMConstInt(i32_type, 8, 0) };
+        let c_16 = unsafe { LLVMConstInt(i32_type, 16, 0) };
+
+        let low = unsafe {
+            let l = LLVMBuildAnd(self.builder, src_i32, c_ff, LLVM_UNNAMED.as_ptr());
+            LLVMBuildShl(self.builder, l, c_8, LLVM_UNNAMED.as_ptr())
+        };
+        let high = unsafe {
+            let h = LLVMBuildAnd(self.builder, src_i32, c_ff00, LLVM_UNNAMED.as_ptr());
+            LLVMBuildShl(self.builder, h, c_16, LLVM_UNNAMED.as_ptr())
+        };
+        let res_i32 = unsafe { LLVMBuildOr(self.builder, low, high, LLVM_UNNAMED.as_ptr()) };
+
+        self.resolver.with_result(arguments.dst, |dst_val| unsafe {
+            LLVMBuildBitCast(self.builder, res_i32, f16x2_type, dst_val)
+        });
+        Ok(())
     }
 
     fn emit_cvt_pack(

@@ -1,6 +1,4 @@
-declare hidden i32 @__zluda_ptx_impl_cvt_rn_f16x2_e5m2x2(i16) #0
-
-define amdgpu_kernel void @cvt_rn_f16x2_e5m2x2(ptr addrspace(4) byref(i64) %"40", ptr addrspace(4) byref(i64) %"41") #1 {
+define amdgpu_kernel void @cvt_rn_f16x2_e5m2x2(ptr addrspace(4) byref(i64) %"40", ptr addrspace(4) byref(i64) %"41") #0 {
   %"42" = alloca i64, align 8, addrspace(5)
   %"43" = alloca i64, align 8, addrspace(5)
   %"44" = alloca i16, align 2, addrspace(5)
@@ -21,20 +19,24 @@ define amdgpu_kernel void @cvt_rn_f16x2_e5m2x2(ptr addrspace(4) byref(i64) %"40"
   %5 = load i16, ptr %"54", align 2
   store i16 %5, ptr addrspace(5) %"44", align 2
   %6 = load i16, ptr addrspace(5) %"44", align 2
-  %"58" = call i32 @__zluda_ptx_impl_cvt_rn_f16x2_e5m2x2(i16 %6)
-  %"55" = bitcast i32 %"58" to <2 x half>
+  %7 = zext i16 %6 to i32
+  %8 = and i32 %7, 255
+  %9 = shl i32 %8, 8
+  %10 = and i32 %7, 65280
+  %11 = shl i32 %10, 16
+  %12 = or i32 %9, %11
+  %"55" = bitcast i32 %12 to <2 x half>
   %"50" = bitcast <2 x half> %"55" to i32
   store i32 %"50", ptr addrspace(5) %"45", align 4
-  %7 = load i64, ptr addrspace(5) %"43", align 8
-  %8 = load i32, ptr addrspace(5) %"45", align 4
-  %"57" = inttoptr i64 %7 to ptr
-  store i32 %8, ptr %"57", align 4
+  %13 = load i64, ptr addrspace(5) %"43", align 8
+  %14 = load i32, ptr addrspace(5) %"45", align 4
+  %"57" = inttoptr i64 %13 to ptr
+  store i32 %14, ptr %"57", align 4
   ret void
 }
 
 ; Function Attrs: nocallback nofree nosync nounwind willreturn
-declare void @llvm.amdgcn.s.dcache.inv() #2
+declare void @llvm.amdgcn.s.dcache.inv() #1
 
-attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="dynamic" "denormal-fp-math-f32"="dynamic" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #1 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="ieee" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
-attributes #2 = { nocallback nofree nosync nounwind willreturn }
+attributes #0 = { "amdgpu-ieee"="false" "amdgpu-unsafe-fp-atomics"="true" "denormal-fp-math"="ieee" "denormal-fp-math-f32"="preserve-sign" "no-trapping-math"="true" "target-features"="+wavefrontsize32,-wavefrontsize64,+cumode,+precise-memory" "uniform-work-group-size"="true" }
+attributes #1 = { nocallback nofree nosync nounwind willreturn }
