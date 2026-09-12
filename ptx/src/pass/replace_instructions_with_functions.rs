@@ -405,12 +405,17 @@ fn run_instruction<'input>(
             // `.texref` does, so `sustref_*` is reachable too -- and there is no
             // `sustref_*` anywhere in the tree.
             //
-            // All valid 2D combinations parsed by `ptx_parser` are implemented in
-            // `ptx/lib/zluda_ptx_impl.cpp`:
-            // - `sustobj` and `sustref`
+            // All valid 2D surface object combinations parsed by `ptx_parser` are
+            // implemented in `ptx/lib/zluda_ptx_impl.cpp`:
             // - formatted `.p` (b32, v2_b32, v4_b32)
             // - raw `.b` ({scalar, v2, v4} x {b8, b16, b32})
-            const IMPLEMENTED: [&str; 24] = [
+            //
+            // Surface references (`sustref_*`) are intentionally excluded from
+            // this whitelist: ZLUDA has no runtime support for `cuSurfRefSetArray`
+            // (it is an unimplemented stub), and `.surfref` variables are uninitialized
+            // in device memory. Rejecting them loudly at compile time prevents silent
+            // writes to null/unbound surface descriptors at runtime.
+            const IMPLEMENTED: [&str; 12] = [
                 "sustobj_p_2d_b32",
                 "sustobj_p_2d_v2_b32",
                 "sustobj_p_2d_v4_b32",
@@ -423,27 +428,24 @@ fn run_instruction<'input>(
                 "sustobj_b_2d_v4_b8",
                 "sustobj_b_2d_v4_b16",
                 "sustobj_b_2d_v4_b32",
-                "sustref_p_2d_b32",
-                "sustref_p_2d_v2_b32",
-                "sustref_p_2d_v4_b32",
-                "sustref_b_2d_b8",
-                "sustref_b_2d_b16",
-                "sustref_b_2d_b32",
-                "sustref_b_2d_v2_b8",
-                "sustref_b_2d_v2_b16",
-                "sustref_b_2d_v2_b32",
-                "sustref_b_2d_v4_b8",
-                "sustref_b_2d_v4_b16",
-                "sustref_b_2d_v4_b32",
             ];
             if !IMPLEMENTED.contains(&name.as_str()) {
-                eprintln!(
-                    "[zluda] `sust` lowering needs `{}`, which zluda_ptx_impl does not define. \
-                     Left as it was, this would drop the entire kernel and report it only as a \
-                     missing kernel. Implement it in ptx/lib/zluda_ptx_impl.cpp and rebuild \
-                     ptx/lib/*.bc.",
-                    name
-                );
+                if name.starts_with("sustref_") {
+                    eprintln!(
+                        "[zluda] `sust` lowering for `{}` rejected: surface references (.surfref) \
+                         have no host runtime binding support (cuSurfRefSetArray is unimplemented). \
+                         Use surface objects (.surfobj / 64-bit integer handle) instead.",
+                        name
+                    );
+                } else {
+                    eprintln!(
+                        "[zluda] `sust` lowering needs `{}`, which zluda_ptx_impl does not define. \
+                         Left as it was, this would drop the entire kernel and report it only as a \
+                         missing kernel. Implement it in ptx/lib/zluda_ptx_impl.cpp and rebuild \
+                         ptx/lib/*.bc.",
+                        name
+                    );
+                }
                 return Err(error_todo());
             }
             to_call(resolver, fn_declarations, name.into(), i)?

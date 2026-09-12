@@ -1488,5 +1488,214 @@ mod tests {
 
         api.cuCtxDestroy_v2(ctx);
     }
+
+    const SURF_WRITE_2D_B32_PTX: &str = concat!(
+        r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry surf_write_2d_b32_byte(
+    .param .u64 surfobj,
+    .param .s32 coord_x,
+    .param .s32 coord_y,
+    .param .b32 data
+) {
+    .reg .b64 %surf;
+    .reg .b32 %x;
+    .reg .b32 %y;
+    .reg .b32 %val;
+
+    ld.param.u64 %surf, [surfobj];
+    ld.param.s32 %x, [coord_x];
+    ld.param.s32 %y, [coord_y];
+    ld.param.b32 %val, [data];
+
+    sust.b.2d.b32 [%surf, {%x, %y}], %val;
+    ret;
+}
+
+.visible .entry surf_write_2d_b32_pixel(
+    .param .u64 surfobj,
+    .param .s32 coord_x,
+    .param .s32 coord_y,
+    .param .b32 data
+) {
+    .reg .b64 %surf;
+    .reg .b32 %x;
+    .reg .b32 %y;
+    .reg .b32 %val;
+
+    ld.param.u64 %surf, [surfobj];
+    ld.param.s32 %x, [coord_x];
+    ld.param.s32 %y, [coord_y];
+    ld.param.b32 %val, [data];
+
+    sust.p.2d.b32 [%surf, {%x, %y}], %val;
+    ret;
+}
+"#,
+        "\0"
+    );
+
+    #[test_cuda]
+    unsafe fn surfobj_write_2d_b32(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut ctx = std::mem::zeroed();
+        api.cuCtxCreate_v2(&mut ctx, 0, 0);
+
+        let width = 8usize;
+        let height = 8usize;
+        let row_bytes = width * std::mem::size_of::<u32>();
+
+        // Create 2D CUDA array with surface load/store capability
+        let desc = CUDA_ARRAY3D_DESCRIPTOR {
+            Width: width,
+            Height: height,
+            Depth: 0,
+            Format: CUarray_format_enum::CU_AD_FORMAT_UNSIGNED_INT32,
+            NumChannels: 1,
+            Flags: CUDA_ARRAY3D_SURFACE_LDST,
+        };
+        let mut array: CUarray = std::ptr::null_mut();
+        api.cuArray3DCreate_v2(&mut array, &desc);
+
+        // Zero-fill the array
+        let zero_buf = vec![0u32; width * height];
+        let copy_init = CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
+            srcHost: zero_buf.as_ptr() as *const c_void,
+            srcDevice: CUdeviceptr_v2(std::ptr::null_mut()),
+            srcArray: std::ptr::null_mut(),
+            srcPitch: row_bytes,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: CUmemorytype::CU_MEMORYTYPE_ARRAY,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: CUdeviceptr_v2(std::ptr::null_mut()),
+            dstArray: array,
+            dstPitch: 0,
+            WidthInBytes: row_bytes,
+            Height: height,
+        };
+        api.cuMemcpy2D_v2(&copy_init);
+
+        // Create surface object over the array
+        let res_desc = CUDA_RESOURCE_DESC {
+            resType: CUresourcetype_enum::CU_RESOURCE_TYPE_ARRAY,
+            res: CUDA_RESOURCE_DESC_st__bindgen_ty_1 {
+                array: CUDA_RESOURCE_DESC_st__bindgen_ty_1__bindgen_ty_1 { hArray: array },
+            },
+            flags: 0,
+        };
+        let mut surfobj: CUsurfObject = std::mem::zeroed();
+        api.cuSurfObjectCreate(&mut surfobj, &res_desc);
+
+        // Verify descriptor query roundtrip
+        let mut queried_desc: CUDA_RESOURCE_DESC = std::mem::zeroed();
+        api.cuSurfObjectGetResourceDesc(&mut queried_desc, surfobj);
+        assert_eq!(queried_desc.resType, CUresourcetype_enum::CU_RESOURCE_TYPE_ARRAY);
+        assert_eq!(queried_desc.res.array.hArray, array);
+
+        // Load PTX module containing sust.b and sust.p kernels
+        let mut module = std::mem::zeroed();
+        api.cuModuleLoadData(&mut module, SURF_WRITE_2D_B32_PTX.as_ptr() as *const c_void);
+
+        // Test 1: sust.b (byte-addressed x coordinate)
+        // Write 0x12345678 to pixel (x=4, y=3) -> coord_x = 4 * 4 = 16, coord_y = 3
+        let mut byte_func = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut byte_func, module, c"surf_write_2d_b32_byte".as_ptr());
+        let val_byte: u32 = 0x12345678;
+        let coord_bx: i32 = 4 * 4; // 16 bytes
+        let coord_by: i32 = 3;
+        let mut params_b: [*mut c_void; 4] = [
+            &surfobj as *const _ as *mut _,
+            &coord_bx as *const _ as *mut _,
+            &coord_by as *const _ as *mut _,
+            &val_byte as *const _ as *mut _,
+        ];
+        api.cuLaunchKernel(
+            byte_func,
+            1, 1, 1,
+            1, 1, 1,
+            0,
+            CUstream(std::ptr::null_mut()),
+            params_b.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+
+        // Test 2: sust.p (pixel-addressed x coordinate)
+        // Write 0xdeadbeef to pixel (x=6, y=5) -> coord_x = 6, coord_y = 5
+        let mut pixel_func = std::mem::zeroed();
+        api.cuModuleGetFunction(&mut pixel_func, module, c"surf_write_2d_b32_pixel".as_ptr());
+        let val_pixel: u32 = 0xdeadbeef;
+        let coord_px: i32 = 6; // 6 pixels
+        let coord_py: i32 = 5;
+        let mut params_p: [*mut c_void; 4] = [
+            &surfobj as *const _ as *mut _,
+            &coord_px as *const _ as *mut _,
+            &coord_py as *const _ as *mut _,
+            &val_pixel as *const _ as *mut _,
+        ];
+        api.cuLaunchKernel(
+            pixel_func,
+            1, 1, 1,
+            1, 1, 1,
+            0,
+            CUstream(std::ptr::null_mut()),
+            params_p.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+
+        api.cuStreamSynchronize(CUstream(std::ptr::null_mut()));
+
+        // Read back array to host
+        let mut readback = vec![0u32; width * height];
+        let copy_readback = CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: CUmemorytype::CU_MEMORYTYPE_ARRAY,
+            srcHost: std::ptr::null_mut(),
+            srcDevice: CUdeviceptr_v2(std::ptr::null_mut()),
+            srcArray: array,
+            srcPitch: 0,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
+            dstHost: readback.as_mut_ptr() as *mut c_void,
+            dstDevice: CUdeviceptr_v2(std::ptr::null_mut()),
+            dstArray: std::ptr::null_mut(),
+            dstPitch: row_bytes,
+            WidthInBytes: row_bytes,
+            Height: height,
+        };
+        api.cuMemcpy2D_v2(&copy_readback);
+
+        // Verify values
+        assert_eq!(readback[3 * width + 4], 0x12345678, "sust.b byte-scaled write failed at (4, 3)");
+        assert_eq!(readback[5 * width + 6], 0xdeadbeef, "sust.p pixel-addressed write failed at (6, 5)");
+
+        // Verify all other pixels are still 0
+        for y in 0..height {
+            for x in 0..width {
+                if (x, y) != (4, 3) && (x, y) != (6, 5) {
+                    assert_eq!(
+                        readback[y * width + x],
+                        0,
+                        "Expected 0 at ({x}, {y}), found {:#x}",
+                        readback[y * width + x]
+                    );
+                }
+            }
+        }
+
+        // Cleanup
+        api.cuSurfObjectDestroy(surfobj);
+        api.cuModuleUnload(module);
+        api.cuArrayDestroy(array);
+        api.cuCtxDestroy_v2(ctx);
+    }
 }
 

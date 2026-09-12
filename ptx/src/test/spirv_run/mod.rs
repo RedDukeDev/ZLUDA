@@ -1441,7 +1441,23 @@ fn test_cuda_assert<
 ) -> Result<(), Box<dyn error::Error>> {
     let cuda = match &*CUDA {
         Ok(cuda) => cuda,
-        Err(_) => return Ok(()),
+        Err(err) => {
+            if std::env::var_os("ZLUDA_REQUIRE_CUDA").is_some() {
+                panic!(
+                    "ZLUDA_REQUIRE_CUDA is set, but NVIDIA CUDA driver DLL could not be loaded: {:?}",
+                    err
+                );
+            }
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[zluda] Warning: NVIDIA CUDA driver DLL not found ({:?}). \
+                     Skipping _cuda comparison tests (set ZLUDA_REQUIRE_CUDA=1 to fail instead).",
+                    err
+                );
+            }
+            return Ok(());
+        }
     };
     let name = CString::new(name)?;
     let result = run_cuda(cuda, name.as_c_str(), ptx_text, input, output, block_dim_x);

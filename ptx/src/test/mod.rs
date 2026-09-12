@@ -141,25 +141,44 @@ fn sust_all_combinations() -> Result<(), TranslateError> {
     sust.b.2d.v4.b16 [%sobj, {%x, %y}], %v4_16;
     sust.b.2d.v4.b32 [%sobj, {%x, %y}], %v4_32;
 
-    // sustref - formatted (.p)
-    sust.p.2d.b32 [surf_var, {%x, %y}], %v32;
-    sust.p.2d.v2.b32 [surf_var, {%x, %y}], %v2_32;
-    sust.p.2d.v4.b32 [surf_var, {%x, %y}], %v4_32;
-
-    // sustref - raw (.b)
-    sust.b.2d.b8 [surf_var, {%x, %y}], %v8;
-    sust.b.2d.b16 [surf_var, {%x, %y}], %v16;
-    sust.b.2d.b32 [surf_var, {%x, %y}], %v32;
-    sust.b.2d.v2.b8 [surf_var, {%x, %y}], %v2_8;
-    sust.b.2d.v2.b16 [surf_var, {%x, %y}], %v2_16;
-    sust.b.2d.v2.b32 [surf_var, {%x, %y}], %v2_32;
-    sust.b.2d.v4.b8 [surf_var, {%x, %y}], %v4_8;
-    sust.b.2d.v4.b16 [surf_var, {%x, %y}], %v4_16;
-    sust.b.2d.v4.b32 [surf_var, {%x, %y}], %v4_32;
-
     ret;
 }
 "#;
     compile_and_assert(ptx_code)
+}
+
+#[test]
+fn sustref_rejected_at_compile_time() {
+    let ptx_code = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.global .surfref surf_var;
+
+.visible .entry test_sustref(
+    .param .u32 x,
+    .param .u32 y,
+    .param .b32 val_b32
+) {
+    .reg .b32 %x;
+    .reg .b32 %y;
+    .reg .b32 %v32;
+
+    ld.param.u32 %x, [x];
+    ld.param.u32 %y, [y];
+    ld.param.b32 %v32, [val_b32];
+
+    sust.b.2d.b32 [surf_var, {%x, %y}], %v32;
+    ret;
+}
+"#;
+    let res = std::panic::catch_unwind(|| {
+        compile_and_assert(ptx_code)
+    });
+    match res {
+        Ok(Err(_)) | Err(_) => {} // Rejected at compile time (panics in debug, Err in release)
+        Ok(Ok(_)) => panic!("sustref should have been rejected at compile time!"),
+    }
 }
 
