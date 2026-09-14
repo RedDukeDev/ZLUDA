@@ -13,6 +13,30 @@ cmake \
     ../llvm && \
 ninja clang llvm-dis llvm-as
 
+NOTE: this comment block is the only record of how the committed .bc files were
+produced -- there is no script, so a change here has to be made by hand in both
+pipelines. What is stripped is `optnone`, and nothing else. The mma wrappers used
+to be marked [[clang::optnone]], which the verifier forces to carry noinline as
+well, and a noinline callee is never inlined -- so every llvm.zluda.mma intrinsic
+stayed inside its wrapper, where CombineMMAPass (same basic block only) could
+never pair it with anything. The .cpp no longer marks the wrappers optnone, so
+the [[clang::always_inline]] on their call sites is honoured at this stage and
+the intrinsic lands in the body of whichever FUNC(...) calls it.
+Stripping `noinline` as well -- which an earlier revision of this recipe did --
+is the part not to copy. It lets every helper inline into the kernel, and that
+measured 86 -> 156 ms at 640x360: the pad and split scaffolding is then
+duplicated at each call site. The helpers that have to stay calls say noinline in
+the source, which is why it must survive the sed. See the pair helper at the end
+of the fp8 section for how the pairing is bought without paying that.
+(The attribute names do not appear as strings in a .bc -- they are enum-encoded
+-- so this cannot be checked by grepping the bitcode. Use
+`llvm-dis zluda_ptx_impl.bc -o - | grep -n 'attributes #'` and read the groups.
+Any llvm-dis at least as new as the one that wrote the file can read it: the
+copy shipped with the HIP SDK (%HIP_PATH%bin\llvm-dis.exe) does, and is what the
+groups quoted here were read with. Only the *writing* tools -- clang and llvm-as
+-- have to come from this tree, so that the re-encoded bitcode is a version this
+LLVM can read back.)
+
 then cd to the directory with this file and run this simple command:
 
 ../../ext/llvm-project/build/bin/clang \
@@ -36,6 +60,7 @@ then cd to the directory with this file and run this simple command:
     | sed '/llvm.module.flags/d' \
     | sed '/__hip_cuid/d' \
     | sed 's/optnone//g' \
+    | sed 's/noinline//g' \
     | sed 's/define hidden/define linkonce_odr/g' \
     | sed 's/\"target-cpu\"=\"gfx1030\"//g' \
     | sed -E 's/\"target-features\"=\"[^\"]+\"//g'| \
@@ -63,6 +88,7 @@ then cd to the directory with this file and run this simple command:
     | sed '/llvm.module.flags/d' \
     | sed '/__hip_cuid/d' \
     | sed 's/optnone//g' \
+    | sed 's/noinline//g' \
     | sed 's/define hidden/define linkonce_odr/g' \
     | sed 's/\"target-cpu\"=\"gfx1030\"//g' \
     | sed -E 's/\"target-features\"=\"[^\"]+\"//g'| \
@@ -1198,9 +1224,22 @@ __device__ HIP_vector_base<Acc, 4>::Native_vec_ fallback_mma_sync_aligned(uint4:
 
 extern "C"
 {
-    // We wrap the intrinsic in an optnone function to prevent ZLUDA-specific
-    // passes from optimizing away the intrinsic call
-    static __device__ float4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone [[clang::optnone]] (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
+    // A named wrapper around the intrinsic rather than a bare call, so that
+    // there is one place to change if the spelling of the intrinsic ever moves.
+    // It used to be marked [[clang::optnone]], for the stated reason that
+    // ZLUDA-specific passes could otherwise optimise the intrinsic call away.
+    // That is no longer done here for two reasons: the bitcode pipeline below
+    // strips optnone out of the shipped .bc anyway, so the protection was not
+    // real by the time anything ran; and LLVM's verifier requires optnone to be
+    // accompanied by noinline, so the wrapper also carried a noinline that the
+    // sed left behind -- and a noinline callee is never inlined, which is
+    // exactly what kept these intrinsics out of the kernel's basic blocks and
+    // therefore invisible to CombineMMAPass. Without optnone the
+    // [[clang::always_inline]] on the call sites below is honoured and the
+    // intrinsic lands directly in the FUNC(...) helper body.
+    // The name keeps its _optnone suffix: it is a symbol, and renaming it buys
+    // nothing that a reader cannot get from this comment.
+    static __device__ float4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
     {
         __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg) __asm("llvm.zluda.mma.m16n8k16.f32.f16.f16.f32");
         return std::bit_cast<float4::Native_vec_>(__llvm_zluda_mma_m16n8k16_f32_f16_f16_f32(a_reg, b_reg, std::bit_cast<uint4::Native_vec_>(c_reg)));
@@ -1272,9 +1311,22 @@ extern "C"
         return {d_first[0], d_first[1], d_second[0], d_second[1]};
     }
 
-    // We wrap the intrinsic in an optnone function to prevent ZLUDA-specific
-    // passes from optimizing away the intrinsic call
-    static __device__ float4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32_optnone [[clang::optnone]] (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
+    // A named wrapper around the intrinsic rather than a bare call, so that
+    // there is one place to change if the spelling of the intrinsic ever moves.
+    // It used to be marked [[clang::optnone]], for the stated reason that
+    // ZLUDA-specific passes could otherwise optimise the intrinsic call away.
+    // That is no longer done here for two reasons: the bitcode pipeline below
+    // strips optnone out of the shipped .bc anyway, so the protection was not
+    // real by the time anything ran; and LLVM's verifier requires optnone to be
+    // accompanied by noinline, so the wrapper also carried a noinline that the
+    // sed left behind -- and a noinline callee is never inlined, which is
+    // exactly what kept these intrinsics out of the kernel's basic blocks and
+    // therefore invisible to CombineMMAPass. Without optnone the
+    // [[clang::always_inline]] on the call sites below is honoured and the
+    // intrinsic lands directly in the FUNC(...) helper body.
+    // The name keeps its _optnone suffix: it is a symbol, and renaming it buys
+    // nothing that a reader cannot get from this comment.
+    static __device__ float4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32_optnone (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
     {
         __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg) __asm("llvm.zluda.mma.m16n8k16.f32.bf16.bf16.f32");
         return std::bit_cast<float4::Native_vec_>(__llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32(a_reg, b_reg, std::bit_cast<uint4::Native_vec_>(c_reg)));
@@ -1292,9 +1344,22 @@ extern "C"
         }
     }
 
-    // We wrap the intrinsic in an optnone function to prevent ZLUDA-specific
-    // passes from optimizing away the intrinsic call
-    static __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32_optnone [[clang::optnone]] (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg)
+    // A named wrapper around the intrinsic rather than a bare call, so that
+    // there is one place to change if the spelling of the intrinsic ever moves.
+    // It used to be marked [[clang::optnone]], for the stated reason that
+    // ZLUDA-specific passes could otherwise optimise the intrinsic call away.
+    // That is no longer done here for two reasons: the bitcode pipeline below
+    // strips optnone out of the shipped .bc anyway, so the protection was not
+    // real by the time anything ran; and LLVM's verifier requires optnone to be
+    // accompanied by noinline, so the wrapper also carried a noinline that the
+    // sed left behind -- and a noinline callee is never inlined, which is
+    // exactly what kept these intrinsics out of the kernel's basic blocks and
+    // therefore invisible to CombineMMAPass. Without optnone the
+    // [[clang::always_inline]] on the call sites below is honoured and the
+    // intrinsic lands directly in the FUNC(...) helper body.
+    // The name keeps its _optnone suffix: it is a symbol, and renaming it buys
+    // nothing that a reader cannot get from this comment.
+    static __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32_optnone (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg)
     {
         __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg) __asm("llvm.zluda.mma.m16n8k32.s32.s8.s8.s32");
         return __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32(a_reg, b_reg, c_reg);
@@ -1396,27 +1461,51 @@ __device__ static inline uint32_t fp8_widen_pair(uint32_t packed, int pair)
     return sign | (std::bit_cast<uint32_t>(scaled) & ~nan_mask) | (nan_mask & 0x7E007E00u);
 }
 
-// One half of the reduction: sixteen of the thirty-two k values.
-__device__ static inline float4::Native_vec_ fp8_mma_half(uint32_t a_row0, uint32_t a_row8,
-                                                          uint32_t b, float4::Native_vec_ acc)
+// Which of the two byte pairs this lane wants out of whatever it is handed.
+__device__ static inline int fp8_pair_index()
 {
-    // Which of the two byte pairs this lane wants out of whatever it is handed.
-    const int pair = int(FUNC_CALL(sreg_laneid)()) & 1;
+    return int(FUNC_CALL(sreg_laneid)()) & 1;
+}
 
+// The A fragment of one k half, widened onto the hardware's f16 form. Split out
+// of fp8_mma_half so that the pair helper below can widen one A and hand it to
+// two MMAs, which is the whole point of that helper.
+__device__ static inline uint4::Native_vec_ fp8_widen_a_half(uint32_t a_row0, uint32_t a_row8,
+                                                            int pair)
+{
     uint4::Native_vec_ a;
     a[0] = fp8_widen_pair(fp8_quad_low(a_row0), pair);
     a[1] = fp8_widen_pair(fp8_quad_low(a_row8), pair);
     a[2] = fp8_widen_pair(fp8_quad_high(a_row0), pair);
     a[3] = fp8_widen_pair(fp8_quad_high(a_row8), pair);
+    return a;
+}
 
+__device__ static inline uint2::Native_vec_ fp8_widen_b_half(uint32_t b, int pair)
+{
     uint2::Native_vec_ bb;
     bb[0] = fp8_widen_pair(fp8_quad_low(b), pair);
     bb[1] = fp8_widen_pair(fp8_quad_high(b), pair);
-
-    return __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a, bb, acc);
+    return bb;
 }
 
-    uint2::Native_vec_ FUNC(mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16)(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint2::Native_vec_ c_reg)
+// One half of the reduction: sixteen of the thirty-two k values.
+__device__ static inline float4::Native_vec_ fp8_mma_half(uint32_t a_row0, uint32_t a_row8,
+                                                          uint32_t b, float4::Native_vec_ acc)
+{
+    const int pair = fp8_pair_index();
+    return __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(
+        fp8_widen_a_half(a_row0, a_row8, pair), fp8_widen_b_half(b, pair), acc);
+}
+
+    // The body of one m16n8k32 e4m3 instruction, shared by the helper below and
+    // by the pair helper beneath it. always_inline is structural rather than an
+    // optimisation: CombineMMAPass pairs only intrinsics that sit in one basic
+    // block, so the four intrinsic calls two paired instructions make have to
+    // land in the pair helper's own body instead of behind another call.
+    __device__ static inline __attribute__((always_inline)) uint2::Native_vec_
+    fp8_mma_e4m3_m16n8k32(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg,
+                          uint2::Native_vec_ c_reg)
     {
         f16x2 c01 = std::bit_cast<f16x2>(c_reg[0]);
         f16x2 c23 = std::bit_cast<f16x2>(c_reg[1]);
@@ -1436,6 +1525,99 @@ __device__ static inline float4::Native_vec_ fp8_mma_half(uint32_t a_row0, uint3
         f16x2 d01 = {f16(d.x), f16(d.y)};
         f16x2 d23 = {f16(d.z), f16(d.w)};
         return {std::bit_cast<uint32_t>(d01), std::bit_cast<uint32_t>(d23)};
+    }
+
+    // noinline rather than FUNC(...) on purpose -- see the pair helper below for
+    // what this body costs when it is allowed into the kernel at every call site.
+    __device__ __attribute__((retain, noinline)) uint2::Native_vec_
+    __zluda_ptx_impl_mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16(
+        uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint2::Native_vec_ c_reg)
+    {
+        return fp8_mma_e4m3_m16n8k32(a_reg, b_reg, c_reg);
+    }
+
+    struct mma_pair_f16
+    {
+        uint2::Native_vec_ d0;
+        uint2::Native_vec_ d1;
+    };
+
+    // Two mma.sync that share their A operand, answered by one call.
+    //
+    // replace_instructions_with_functions.rs emits this when it finds such a
+    // pair adjacent in a basic block. Returning two vectors is what lets one
+    // call write two destination registers: emit.rs turns a call with more than
+    // one return value into a struct return plus an extractvalue per result.
+    //
+    // Why the pairing is worth having: PTX m16n8k32 gives a lane sixteen A bytes
+    // over eight columns where the hardware form takes eight over sixteen, so
+    // one instruction on its own uses half the multiply it pays for -- the rest
+    // of its B fragment is zeros. Two instructions that share A can share the
+    // hardware operation instead, which is the pairing CombineMMAPass performs
+    // on the four intrinsics below, and this body is what puts all four in one
+    // basic block. The A widening the two instructions have in common is also
+    // CSE'd to one here.
+    //
+    // It has to stay out of line. Making the same intrinsics pairable by
+    // inlining the helpers into the kernel is the other route, and it measured
+    // 86 -> 156 ms at 640x360, because the pad and split scaffolding is then
+    // duplicated at every call site instead of being shared.
+    __device__ __attribute__((retain, noinline)) mma_pair_f16
+    __zluda_ptx_impl_mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16_pair(
+        uint4::Native_vec_ a_reg, uint2::Native_vec_ b0_reg, uint2::Native_vec_ c0_reg,
+        uint2::Native_vec_ b1_reg, uint2::Native_vec_ c1_reg)
+    {
+        mma_pair_f16 pair;
+        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 13000)
+        {
+            // Read once: both instructions want the same byte pair out of
+            // whatever they are handed.
+            const int index = fp8_pair_index();
+            f16x2 c0_01 = std::bit_cast<f16x2>(c0_reg[0]);
+            f16x2 c0_23 = std::bit_cast<f16x2>(c0_reg[1]);
+            f16x2 c1_01 = std::bit_cast<f16x2>(c1_reg[0]);
+            f16x2 c1_23 = std::bit_cast<f16x2>(c1_reg[1]);
+            float4::Native_vec_ d0 = {float(c0_01.x), float(c0_01.y), float(c0_23.x),
+                                      float(c0_23.y)};
+            float4::Native_vec_ d1 = {float(c1_01.x), float(c1_01.y), float(c1_23.x),
+                                      float(c1_23.y)};
+
+            // Interleaved on purpose, and this arrangement is the point of the
+            // whole helper. The two intrinsics that share a widened A are the
+            // two the combiner pairs, so they are placed next to each other;
+            // the only instructions between them are pure arithmetic, which is
+            // what its reorder test accepts. Writing this as two calls to
+            // fp8_mma_e4m3_m16n8k32 -- the obvious shape -- puts each
+            // instruction's own two halves in one block instead and leaves the
+            // pair to be matched across blocks, where the pass will not look.
+            //
+            // Accumulation order per destination is unchanged (k 0..15, then
+            // k 16..31), so the results are the same to the bit.
+            const uint4::Native_vec_ a_lo = fp8_widen_a_half(a_reg[0], a_reg[1], index);
+            const uint2::Native_vec_ b0_lo = fp8_widen_b_half(b0_reg[0], index);
+            const uint2::Native_vec_ b1_lo = fp8_widen_b_half(b1_reg[0], index);
+            d0 = __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a_lo, b0_lo, d0);
+            d1 = __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a_lo, b1_lo, d1);
+
+            const uint4::Native_vec_ a_hi = fp8_widen_a_half(a_reg[2], a_reg[3], index);
+            const uint2::Native_vec_ b0_hi = fp8_widen_b_half(b0_reg[1], index);
+            const uint2::Native_vec_ b1_hi = fp8_widen_b_half(b1_reg[1], index);
+            d0 = __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a_hi, b0_hi, d0);
+            d1 = __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a_hi, b1_hi, d1);
+
+            f16x2 d0_01 = {f16(d0.x), f16(d0.y)};
+            f16x2 d0_23 = {f16(d0.z), f16(d0.w)};
+            f16x2 d1_01 = {f16(d1.x), f16(d1.y)};
+            f16x2 d1_23 = {f16(d1.z), f16(d1.w)};
+            pair.d0 = {std::bit_cast<uint32_t>(d0_01), std::bit_cast<uint32_t>(d0_23)};
+            pair.d1 = {std::bit_cast<uint32_t>(d1_01), std::bit_cast<uint32_t>(d1_23)};
+        }
+        else
+        {
+            pair.d0 = fp8_mma_e4m3_m16n8k32(a_reg, b0_reg, c0_reg);
+            pair.d1 = fp8_mma_e4m3_m16n8k32(a_reg, b1_reg, c1_reg);
+        }
+        return pair;
     }
 }
 

@@ -99,6 +99,7 @@ fn run_statements<'input>(
     >,
     statements: Vec<Statement<ast::Instruction<SpirvWord>, SpirvWord>>,
 ) -> Result<Vec<Statement<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
+    let statements = fuse_mma_pairs(resolver, fn_declarations, statements)?;
     statements
         .into_iter()
         .map(|statement| {
@@ -526,25 +527,19 @@ fn run_instruction<'input>(
                 },
             ..
         } => {
-            let cd_type_name = scalar_to_ptx_name(cd_type_scalar);
-            let ab_type_name = scalar_to_ptx_name(ab_type_scalar);
-            let dimensions = match k {
-                8 => "m16n8k8",
-                32 => "m16n8k32",
-                _ => "m16n8k16",
-            };
-            let name = format!(
-                "mma_sync_aligned_{dimensions}_{}_{}_{cd_type_name}_{ab_type_name}_{ab_type_name}_{cd_type_name}",
-                match alayout {
-                    ast::MatrixLayout::Row => "row",
-                    ast::MatrixLayout::Col => "col",
-                },
-                match blayout {
-                    ast::MatrixLayout::Row => "row",
-                    ast::MatrixLayout::Col => "col",
-                }
-            );
-            to_call(resolver, fn_declarations, name.into(), i)?
+            to_call(
+                resolver,
+                fn_declarations,
+                mma_helper_name(&ast::MmaDetails {
+                    alayout,
+                    blayout,
+                    cd_type_scalar,
+                    ab_type_scalar,
+                    k,
+                })
+                .into(),
+                i,
+            )?
         }
         i @ ptx_parser::Instruction::Sqrt {
             data:
@@ -699,6 +694,156 @@ fn run_instruction<'input>(
         }
         i => i,
     })
+}
+
+// The name of the helper that lowers one mma.sync. Building it is also how the
+// pairing below decides that two instructions have the same shape: every field
+// of MmaDetails ends up in the name, so comparing names is both simpler and
+// stricter than comparing the fields one at a time.
+fn mma_helper_name(data: &ast::MmaDetails) -> String {
+    let cd_type_name = scalar_to_ptx_name(data.cd_type_scalar);
+    let ab_type_name = scalar_to_ptx_name(data.ab_type_scalar);
+    let dimensions = match data.k {
+        8 => "m16n8k8",
+        32 => "m16n8k32",
+        _ => "m16n8k16",
+    };
+    format!(
+        "mma_sync_aligned_{dimensions}_{}_{}_{cd_type_name}_{ab_type_name}_{ab_type_name}_{cd_type_name}",
+        match data.alayout {
+            ast::MatrixLayout::Row => "row",
+            ast::MatrixLayout::Col => "col",
+        },
+        match data.blayout {
+            ast::MatrixLayout::Row => "row",
+            ast::MatrixLayout::Col => "col",
+        }
+    )
+}
+
+// The one shape zluda_ptx_impl has a pair helper for. Spelled out in full rather
+// than tested in parts, so that a shape nobody wrote a pair helper for cannot be
+// paired into a call that does not exist.
+const PAIRED_MMA_SHAPE: &str = "mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16";
+
+fn mma_pair_helper_name(data: &ast::MmaDetails) -> Option<String> {
+    let single = mma_helper_name(data);
+    (single == PAIRED_MMA_SHAPE).then(|| [single.as_str(), "_pair"].concat())
+}
+
+// Two mma.sync that share their A operand lower to one call to a pair helper
+// instead of two calls to the single one. zluda_ptx_impl.cpp says why that is
+// worth a helper at all, and what the same pairing costs when it is bought with
+// inlining instead.
+//
+// The gate is narrow because the transformation is a correctness question before
+// it is a speed one: two instructions can only share one hardware operation if
+// nothing orders them against each other, so the second must not read what the
+// first writes, and both cannot write the same register. Anything that fails the
+// gate falls through to the ordinary one-helper-per-instruction path, which is
+// what every instruction got before this existed.
+//
+// STATUS (2026-09-14): pending. On the DLSS-NR network this gate never fires --
+// one module lowers 3608 mma.sync to the single e4m3 helper and 0 to the pair
+// helper -- because two mma.sync sharing an A operand are never adjacent there:
+// the second one's B is loaded in between, so fusing them would move that load
+// across the first instruction. Widening the gate would change what the kernels
+// compute. It is kept because the shape it recognises is a real one for other
+// snippets, and because the body it calls is already verified in the .bc; it is
+// not part of any measured gain.
+fn pair_is_fusable(
+    first: &Statement<ast::Instruction<SpirvWord>, SpirvWord>,
+    second: Option<&Statement<ast::Instruction<SpirvWord>, SpirvWord>>,
+) -> bool {
+    let (
+        Statement::Instruction(ast::Instruction::Mma { data, arguments }),
+        Some(Statement::Instruction(ast::Instruction::Mma {
+            data: next_data,
+            arguments: next_arguments,
+        })),
+    ) = (first, second)
+    else {
+        return false;
+    };
+    mma_pair_helper_name(data).is_some()
+        && mma_helper_name(data) == mma_helper_name(next_data)
+        && arguments.src1 == next_arguments.src1
+        && arguments.dst != next_arguments.dst
+        && arguments.dst != next_arguments.src1
+        && arguments.dst != next_arguments.src2
+        && arguments.dst != next_arguments.src3
+}
+
+fn fuse_mma_pairs<'input>(
+    resolver: &mut GlobalStringIdentResolver2<'input>,
+    fn_declarations: &mut BTreeMap<
+        Cow<'input, str>,
+        (
+            Vec<ast::Variable<SpirvWord>>,
+            SpirvWord,
+            Vec<ast::Variable<SpirvWord>>,
+        ),
+    >,
+    statements: Vec<Statement<ast::Instruction<SpirvWord>, SpirvWord>>,
+) -> Result<Vec<Statement<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
+    let mut result = Vec::with_capacity(statements.len());
+    let mut statements = statements.into_iter().peekable();
+    while let Some(first) = statements.next() {
+        if !pair_is_fusable(&first, statements.peek()) {
+            result.push(first);
+            continue;
+        }
+        let second = statements.next().ok_or_else(error_unreachable)?;
+        let (
+            Statement::Instruction(ast::Instruction::Mma { data, arguments }),
+            Statement::Instruction(ast::Instruction::Mma {
+                arguments: next_arguments,
+                ..
+            }),
+        ) = (first, second)
+        else {
+            return Err(error_unreachable());
+        };
+        let name = mma_pair_helper_name(&data).ok_or_else(error_unreachable)?;
+        let return_arguments = vec![
+            (data.dtype(), ast::StateSpace::Reg),
+            (data.dtype(), ast::StateSpace::Reg),
+        ];
+        let input_arguments = vec![
+            (data.atype(), ast::StateSpace::Reg),
+            (data.btype(), ast::StateSpace::Reg),
+            (data.ctype(), ast::StateSpace::Reg),
+            (data.btype(), ast::StateSpace::Reg),
+            (data.ctype(), ast::StateSpace::Reg),
+        ];
+        let func = get_or_declare_function(
+            resolver,
+            fn_declarations,
+            name,
+            &return_arguments,
+            &input_arguments,
+        );
+        result.push(Statement::Instruction(ast::Instruction::Call {
+            data: ptx_parser::CallDetails {
+                uniform: false,
+                return_arguments,
+                input_arguments,
+            },
+            arguments: ptx_parser::CallArgs {
+                return_arguments: vec![arguments.dst, next_arguments.dst],
+                func,
+                input_arguments: vec![
+                    arguments.src1,
+                    arguments.src2,
+                    arguments.src3,
+                    next_arguments.src2,
+                    next_arguments.src3,
+                ],
+                is_external: true,
+            },
+        }));
+    }
+    Ok(result)
 }
 
 // An instruction lowered to a function that zluda_ptx_impl does not define ends up

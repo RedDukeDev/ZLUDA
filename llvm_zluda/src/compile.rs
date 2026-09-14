@@ -525,6 +525,11 @@ fn init_globals() -> Result<(), String> {
                 //c"-debug",
                 // Uncomment to save passes
                 // c"-print-before-all",
+                // NOTE: passing an extra option here makes the parse fail before
+                // any module compiles (LLVMZludaParseCommandLineOptions returns
+                // false and every cuModuleLoadData then fails), so diagnostics in
+                // the AMDGPU pipeline are switched on in the pass itself instead.
+                // c"-zluda-mma-stats",
                 c"llvm_zluda",
                 //c"-debug-only=isel",
                 c"-ignore-tti-inline-compatible",

@@ -404,7 +404,19 @@ fn get_cache_key<'a, 'b>(
             // and the digest only covers the bitcode. Any change to emitted
             // code bumps this marker, or every user with a warm cache keeps
             // running the binary the old key compiled.
+            //
+            // Appended rather than rewritten: each suffix names one such change,
+            // and a growing list cannot collide with itself the way a replaced
+            // literal can.
             "/fp8-inline-r1",
+            // Two mma.sync instructions that share their A operand now lower to
+            // one call to a pair helper instead of two calls to the single one
+            // (ptx/src/pass/replace_instructions_with_functions.rs, and the
+            // helper in ptx/lib/zluda_ptx_impl.cpp). The ptx_impl digest does
+            // see the matching bitcode rebuild, but the pass that decides
+            // whether a pair exists lives in this crate, so a warm cache would
+            // otherwise keep serving modules the old AST produced.
+            "/mma-pair-r1",
         ),
         device: isa,
         backend_key: serialized_attributes,
