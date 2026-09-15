@@ -309,7 +309,12 @@ fn get_best_ptx_and_compile(
         )
     })?;
     let mut hip_module = unsafe { mem::zeroed() };
-    unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
+    if let Err(e) = unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) } {
+        if debug_compile() {
+            eprintln!("[zluda] hipModuleLoadData failed: {:?} ({} byte object)", e, elf_module.len());
+        }
+        return Err(e.into());
+    }
     Ok((hip_module, sm_version, zluda32))
 }
 

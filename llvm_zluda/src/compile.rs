@@ -461,6 +461,18 @@ pub fn compile(
         run_optimizer(&linked, &target_machine)?;
         phase("O3 optimisation");
 
+        // ZLUDA_DUMP_OPT_IR names a file to receive the IR as the backend gets
+        // it, after every pass of the optimiser -- the ZLUDA ones included.
+        // ZLUDA_DUMP_IR in zluda/src/impl/module.rs writes it before them, which
+        // cannot tell a construct the passes left behind from one the backend
+        // made up on its own during instruction selection.
+        if let Some(path) = std::env::var_os("ZLUDA_DUMP_OPT_IR") {
+            let text = linked.print_module_to_string();
+            if let Err(e) = std::fs::write(&path, text.to_bytes()) {
+                eprintln!("[zluda] ZLUDA_DUMP_OPT_IR: {e}");
+            }
+        }
+
         if parts > 1 {
             let objects = emit_objects_in_parallel(&linked, parts, gcn_arch)?;
             phase(&format!("codegen in {} parts", objects.len()));
