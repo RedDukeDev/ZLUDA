@@ -55,7 +55,32 @@ fn path_to_cstring(path: &std::path::Path) -> Result<CString, String> {
     CString::new(path_str).map_err(|_| ("path includes invalid null byte").to_string())
 }
 
+// Whether this process is building for a generic family target. Read from the
+// same variable that chooses the target, because the LLVM options that have to
+// agree with it are parsed once for the process, before any module is seen.
+fn targeting_generic_family() -> bool {
+    static GENERIC: OnceLock<bool> = OnceLock::new();
+    *GENERIC.get_or_init(|| {
+        std::env::var("ZLUDA_TARGET_ARCH")
+            .map(|arch| arch.contains("generic"))
+            .unwrap_or(false)
+    })
+}
+
 fn get_isa_version_from_gcn_arch(gcn_arch: &str) -> Result<u32, String> {
+    // A generic target names a whole family rather than one part -- one binary
+    // that loads on every GPU in it. The device libraries and this project's own
+    // bitcode branch on __oclc_ISA_version, and the FP8 path picks its emulation
+    // by it, so a family gets the version of its first member: that is the same
+    // choice every member of the family would have made.
+    if let Some(family) = match gcn_arch {
+        "gfx10-3-generic" => Some(10300),
+        "gfx11-generic" => Some(11000),
+        "gfx12-generic" => Some(12000),
+        _ => None,
+    } {
+        return Ok(family);
+    }
     let base: u32 = gcn_arch
         .replace("gfx", "")
         .parse()
@@ -72,7 +97,14 @@ fn create_oclc_constants(ctx: &Context, gcn_arch: &str) -> Result<Module, String
     // used by ockl
     add_constant(ctx, &module, c"__oclc_wavefrontsize64", 0);
     add_constant(ctx, &module, c"__oclc_wavefrontsize_log2", 5);
-    add_constant(ctx, &module, c"__oclc_ABI_version", 500);
+    // Must agree with -amdhsa-code-object-version above: 500 is version 5,
+    // 600 is version 6, which the generic family targets require.
+    add_constant(
+        ctx,
+        &module,
+        c"__oclc_ABI_version",
+        if targeting_generic_family() { 600 } else { 500 },
+    );
     add_constant(
         ctx,
         &module,
@@ -387,7 +419,17 @@ fn init_globals() -> Result<(), String> {
                 c"-ignore-tti-inline-compatible",
                 // c"-amdgpu-early-inline-all=true",
                 c"-amdgpu-internalize-symbols",
-                c"-amdhsa-code-object-version=5",
+                // Code object version 5 unless a generic family target is
+                // asked for: those are refused below version 6, which is what
+                // carries the load-time resolution that lets one binary serve a
+                // whole family. These options are parsed once for the process,
+                // before any module names its target, so the choice is read
+                // from the same variable that picks the target.
+                if targeting_generic_family() {
+                    c"-amdhsa-code-object-version=6"
+                } else {
+                    c"-amdhsa-code-object-version=5"
+                },
                 //c"--pass-remarks-missed=.*inlin.*",
             ]
             .into_iter();

@@ -279,7 +279,26 @@ fn get_best_ptx_and_compile(
     // How many kernels the PTX asks for. Both the cache and the translation are
     // held to it: an object with none of them is not an answer.
     let kernels_wanted = count_kernels_declared(&module);
-    let cached_binary = load_cached_binary(&mut cache_with_key, kernels_wanted);
+    let mut cached_binary = load_cached_binary(&mut cache_with_key, kernels_wanted);
+    // The exact device missed. Before paying for a translation, try the
+    // family-generic name: a module built for e.g. gfx11-generic loads on
+    // every card in that family regardless of which one is actually present
+    // (that is the whole point of the generic target -- see get_gcn_arch), so
+    // a cache shipped keyed under the generic name still answers here even
+    // though gcn_arch itself is the specific device. Skipped for a device that
+    // is already generic, to avoid asking the same question twice.
+    if cached_binary.is_none() {
+        if let Some(generic) = family_generic_name(gcn_arch) {
+            if let (Some(text), Some(p)) = (text, global_state.cache_path.as_ref()) {
+                let mut generic_cache_with_key = (|| {
+                    let cache = zluda_cache::ModuleCache::open(p)?;
+                    let key = get_cache_key(generic, &text, &attributes)?;
+                    Some((cache, key))
+                })();
+                cached_binary = load_cached_binary(&mut generic_cache_with_key, kernels_wanted);
+            }
+        }
+    }
     let (elf_module, sm_version, zluda32) = cached_binary.ok_or(CUerror::UNKNOWN).or_else(|_| {
         compile_and_cache(
             gcn_arch,
@@ -322,8 +341,42 @@ fn get_hip_properties<'a>() -> Result<hipDeviceProp_tR0600, CUerror> {
 }
 
 fn get_gcn_arch<'a>(props: &'a hipDeviceProp_tR0600) -> Result<&'a str, CUerror> {
+    // ZLUDA_TARGET_ARCH replaces the name the device reports, so a module can be
+    // built for a generic family target -- gfx11-generic and its siblings, one
+    // binary that loads on every GPU in the family -- instead of for the exact
+    // part it happens to be translated on.
+    //
+    // It decides both what is compiled and the key the result is filed under,
+    // which is the whole point: a cache built this way is found again by every
+    // card in the family, so it can be shipped already full and nothing has to
+    // be translated on the user's machine. The cost is that a generic target
+    // turns on every erratum workaround the family needs, which a build for one
+    // part would not carry.
+    static OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+    if let Some(arch) = OVERRIDE.get_or_init(|| std::env::var("ZLUDA_TARGET_ARCH").ok()) {
+        return Ok(arch.as_str());
+    }
     let gcn_arch = unsafe { CStr::from_ptr(props.gcnArchName.as_ptr()) };
     gcn_arch.to_str().map_err(|_| CUerror::UNKNOWN)
+}
+
+// The generic family name for a specific device string, or None if the
+// device already is a generic name or the family is not one ZLUDA ships a
+// generic target for. Strips feature suffixes (gcnArchName carries things
+// like ":sramecc+:xnack-") before matching the numeric prefix.
+fn family_generic_name(gcn_arch: &str) -> Option<&'static str> {
+    let base = gcn_arch.split(':').next().unwrap_or(gcn_arch);
+    if base.ends_with("-generic") {
+        return None;
+    }
+    let base = base.strip_prefix("gfx")?;
+    let base: u32 = base.parse().ok()?;
+    match base / 100 {
+        10 if (base / 10) % 10 == 3 => Some("gfx10-3-generic"),
+        11 => Some("gfx11-generic"),
+        12 => Some("gfx12-generic"),
+        _ => None,
+    }
 }
 
 fn get_cache_key<'a, 'b>(
