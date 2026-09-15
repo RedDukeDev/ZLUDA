@@ -152,6 +152,23 @@ pub fn count_kernels(elf_bytes: &[u8]) -> Option<usize> {
     )
 }
 
+// The code size of each kernel in an object, by name. Used to weigh one
+// translation of a module against another: the matrix-multiply fusion is kept
+// only where it does not balloon a kernel, and the kernel's own code size is
+// the proxy for that. A kernel is a defined function symbol; the .kd metadata
+// symbol that shares its base name is not a function and is skipped.
+pub fn kernel_code_sizes(elf_bytes: &[u8]) -> Vec<(String, u64)> {
+    let elf_file = match object::read::elf::ElfFile64::<Endianness>::parse(elf_bytes) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    elf_file
+        .symbols()
+        .filter(|symbol| symbol.kind() == object::SymbolKind::Text && symbol.is_definition())
+        .filter_map(|symbol| Some((symbol.name().ok()?.to_string(), symbol.size())))
+        .collect()
+}
+
 fn read_object<'a, T: Portable>(elf_bytes: &'a [u8], section: &str, version: u64) -> Option<&'a T> {
     let elf_file = object::read::elf::ElfFile64::<Endianness>::parse(elf_bytes).ok()?;
     let zluda_section = elf_file.section_by_name(section)?;

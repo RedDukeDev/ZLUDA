@@ -21,6 +21,14 @@ use tempfile::NamedTempFile;
 
 const OCKL_MODULE: &[u8] = include_bytes!("device-libs/ockl.bc");
 
+extern "C" {
+    // Forces CombineMMA's wrapper opening on (1) or off (0), or hands the
+    // decision back to the ZLUDA_MMA_OPEN environment variable (-1). Defined in
+    // the fork's CombineMMA.cpp; used by the selective build to compile a
+    // module both ways.
+    fn zludaSetMMAOpen(on: std::ffi::c_int);
+}
+
 // https://llvm.org/docs/AMDGPUUsage.html#address-spaces
 const CONSTANT_ADDRESS_SPACE: u32 = 4;
 
@@ -178,6 +186,51 @@ fn codegen_parts() -> u32 {
     }
 }
 
+// Optimises a module and generates its code, the way the ordinary path does,
+// packaged so it can be run twice on two copies of a module -- once with the
+// matrix-multiply fusion on and once off -- when the selective build asks for
+// it. The debug hook is left out: it is a single-module aid and does not fit a
+// path that builds two.
+fn optimize_and_emit(
+    module: &Module,
+    gcn_arch: &str,
+    parts: u32,
+) -> Result<Vec<Vec<u8>>, String> {
+    let target_machine = make_target_machine(gcn_arch)?;
+    run_optimizer(module, &target_machine)?;
+    if parts > 1 {
+        emit_objects_in_parallel(module, parts, gcn_arch)
+    } else {
+        let object = target_machine
+            .emit_to_memory_buffer(module, LLVMCodeGenFileType::LLVMObjectFile)?
+            .to_vec();
+        Ok(vec![object])
+    }
+}
+
+// Whether to build each module both ways and keep the fused one only where it
+// pays, and the per-kernel code-size ratio that decides "pays". Driven by
+// ZLUDA_SELECTIVE_FUSE: absent, empty or "0" turns it off (the default, since
+// it doubles translation time); any other value turns it on, and a value that
+// parses as a ratio above one sets the threshold, otherwise it is the default
+// below.
+//
+// The default, 2.13, is where the network's kernels separate: the spatial
+// kernels fusion speeds up grow by at most 2.08x and the transformer ones it
+// slows down by 2.18x and more. That gap is narrow, and object size is only a
+// proxy for the register pressure that actually decides it, so the threshold is
+// not a sharp line -- but it does not have to be. Fusion is bit-for-bit
+// identical either way, so a wrong call costs a little speed and never
+// correctness, and the shipped cache is measured before it goes out. Whole
+// networks that separate elsewhere can pass their own ratio.
+fn selective_fuse_threshold() -> Option<f64> {
+    let value = std::env::var("ZLUDA_SELECTIVE_FUSE").ok()?;
+    if value.is_empty() || value == "0" {
+        return None;
+    }
+    Some(value.parse().ok().filter(|r: &f64| *r > 1.0).unwrap_or(2.13))
+}
+
 // Cuts an already optimised module up and generates code for each part on its
 // own thread. Each worker builds its own context and target machine: an
 // LLVMContext belongs to one thread, so nothing but bytes crosses between them.
@@ -294,35 +347,130 @@ pub fn compile(
         hook(&data, String::from("linked.ll"));
     }
 
-    let target_machine = make_target_machine(gcn_arch)?;
-
-    run_optimizer(&linked, &target_machine)?;
-    phase("O3 optimisation");
-
     let parts = codegen_parts();
-    let object_files: Vec<Vec<u8>> = if parts > 1 {
-        let objects = emit_objects_in_parallel(&linked, parts, gcn_arch)?;
-        phase(&format!("codegen in {} parts", objects.len()));
-        objects
-    } else {
-        if let Some(hook) = compiler_hook {
-            // Run compiler hook on optimized human-readable LLVM IR
-            let message = linked.print_module_to_string();
-            let data = message.to_bytes().to_vec();
-            hook(&data, String::from("opt.ll"));
+    let object_files: Vec<Vec<u8>> = if let Some(threshold) = selective_fuse_threshold() {
+        // Fuse the matrix multiplies only where it pays.
+        //
+        // CombineMMA can fuse two of NVIDIA's m16n8k16 multiplies that share
+        // their A operand into one AMD 16x16x16 -- the FP8 path issues each
+        // multiply half-utilised, so this halves them, and the matrix multiply
+        // is the great majority of these kernels' time. But to fuse it has to
+        // open the noinline wrapper the intrinsic hides in, and that removes a
+        // scheduling barrier: on some kernels the register pressure then
+        // explodes into spill traffic that costs more than the fusion saves.
+        // Measured across the network, the spatial (tinlayout) kernels win by
+        // about 20% and the transformer (vit) kernels lose by far more.
+        //
+        // So each module is built both ways and the fused result kept only
+        // when it did not balloon. Kernel code size is the proxy for the spill
+        // traffic that decides it: the kernels fusion speeds up grow by up to
+        // about 2.08x, the ones it slows down by 2.18x and more, and the
+        // threshold sits between. The comparison is per module, which is enough
+        // because the network's modules are homogeneous -- each is all spatial
+        // or all transformer kernels -- and it is taken from the worst kernel
+        // rather than the module total, which an average over the many kernels
+        // that carry no multiplies would otherwise bury.
+        //
+        // This doubles a module's translation time, so it is off unless asked
+        // for: it is meant for building the shipped cache, where the cost is
+        // paid once. CombineMMA takes the fusion flag through zludaSetMMAOpen,
+        // a direct setter rather than the environment, because on Windows a
+        // std::env::set_var here does not reach the C runtime's getenv in the
+        // pass. The optimiser runs single-threaded, so setting it around each
+        // attempt is safe as long as compile() is not entered concurrently
+        // within one process -- and it is not, modules translate one at a time
+        // or in separate processes under the precompile tool.
+        let fused_module = linked.clone();
 
-            // Running a disassembler would be a bit of a pain, so run codegen as assembly
-            let assembly = target_machine
-                .emit_to_memory_buffer(&linked.clone(), LLVMCodeGenFileType::LLVMAssemblyFile)?
-                .to_vec();
-            hook(&assembly, String::from("asm"))
+        unsafe { zludaSetMMAOpen(0) };
+        let unfused = optimize_and_emit(&linked, gcn_arch, parts)?;
+        phase("optimisation and codegen, unfused");
+
+        unsafe { zludaSetMMAOpen(1) };
+        let fused = optimize_and_emit(&fused_module, gcn_arch, parts);
+        unsafe { zludaSetMMAOpen(-1) };
+        let fused = fused?;
+        phase("optimisation and codegen, fused");
+
+        // The decision is per kernel, taken from the worst one, not from the
+        // module's total size. A module holds tens of kernels and only some
+        // carry FP8 multiplies; averaging over all of them buries the few that
+        // balloon -- the transformer module's total grows only 1.28x while its
+        // qkv kernel alone grows 1.94x. Since the network's modules are
+        // homogeneous -- all spatial or all transformer -- the worst kernel
+        // decides the module, and the whole module is kept fused or not.
+        let sizes = |objects: &Vec<Vec<u8>>| {
+            let mut map = std::collections::HashMap::<String, u64>::new();
+            for object in objects {
+                for (name, size) in kernel_metadata::kernel_code_sizes(object) {
+                    *map.entry(name).or_insert(0) += size;
+                }
+            }
+            map
+        };
+        let un_sizes = sizes(&unfused);
+        let fu_sizes = sizes(&fused);
+        // Ignore kernels too small to trust a ratio from, and kernels fusion
+        // did not touch (identical size): the signal is in the ones it grew.
+        let mut worst = 1.0f64;
+        let mut worst_kernel = String::new();
+        for (name, &un_size) in &un_sizes {
+            let fu_size = fu_sizes.get(name).copied().unwrap_or(un_size);
+            if un_size < 4096 || fu_size <= un_size {
+                continue;
+            }
+            let ratio = fu_size as f64 / un_size as f64;
+            if ratio > worst {
+                worst = ratio;
+                worst_kernel = name.clone();
+            }
         }
+        let keep_fused = worst < threshold;
+        eprintln!(
+            "[zluda] fusion: worst kernel {:.2}x ({}) -> {}",
+            worst,
+            if worst_kernel.is_empty() {
+                "no kernel fused"
+            } else {
+                &worst_kernel
+            },
+            if keep_fused { "keeping fused" } else { "keeping unfused" }
+        );
+        if keep_fused {
+            fused
+        } else {
+            unfused
+        }
+    } else {
+        let target_machine = make_target_machine(gcn_arch)?;
 
-        let object = target_machine
-            .emit_to_memory_buffer(&linked, LLVMCodeGenFileType::LLVMObjectFile)?
-            .to_vec();
-        phase("codegen");
-        vec![object]
+        run_optimizer(&linked, &target_machine)?;
+        phase("O3 optimisation");
+
+        if parts > 1 {
+            let objects = emit_objects_in_parallel(&linked, parts, gcn_arch)?;
+            phase(&format!("codegen in {} parts", objects.len()));
+            objects
+        } else {
+            if let Some(hook) = compiler_hook {
+                // Run compiler hook on optimized human-readable LLVM IR
+                let message = linked.print_module_to_string();
+                let data = message.to_bytes().to_vec();
+                hook(&data, String::from("opt.ll"));
+
+                // Running a disassembler would be a bit of a pain, so run codegen as assembly
+                let assembly = target_machine
+                    .emit_to_memory_buffer(&linked.clone(), LLVMCodeGenFileType::LLVMAssemblyFile)?
+                    .to_vec();
+                hook(&assembly, String::from("asm"))
+            }
+
+            let object = target_machine
+                .emit_to_memory_buffer(&linked, LLVMCodeGenFileType::LLVMObjectFile)?
+                .to_vec();
+            phase("codegen");
+            vec![object]
+        }
     };
 
     // Any of the objects serves as the model for the metadata sections below:
