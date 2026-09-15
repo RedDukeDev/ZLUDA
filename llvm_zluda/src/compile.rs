@@ -130,7 +130,21 @@ fn create_oclc_constants(ctx: &Context, gcn_arch: &str) -> Result<Module, String
 fn make_target_machine(gcn_arch: &str) -> Result<TargetMachine, String> {
     let triple = c"amdgcn-amd-amdhsa";
     let cpu = CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
-    let features = c"-wavefrontsize64,+cumode";
+    // ZLUDA_EXTRA_TARGET_FEATURES: diagnostic escape hatch, comma-separated
+    // LLVM target-feature flags (e.g. "+allocate1_5xvgprs") appended to the
+    // usual pair. Exists to measure the cost of one subtarget feature without
+    // a second gcn_arch string and a second cache key. Not meant to ship set.
+    let mut features_owned = "-wavefrontsize64,+cumode".to_string();
+    if let Ok(extra) = std::env::var("ZLUDA_EXTRA_TARGET_FEATURES") {
+        if !extra.is_empty() {
+            features_owned.push(',');
+            features_owned.push_str(&extra);
+        }
+    }
+    if std::env::var_os("ZLUDA_DEBUG_COMPILE").is_some() {
+        eprintln!("[zluda] target machine: cpu={} features={}", gcn_arch, features_owned);
+    }
+    let features = CString::new(features_owned).map_err(|_| ("invalid target features").to_string())?;
 
     let mut target = unsafe { std::mem::zeroed() };
     let mut err = ptr::null_mut();
@@ -143,7 +157,7 @@ fn make_target_machine(gcn_arch: &str) -> Result<TargetMachine, String> {
         target,
         triple,
         &cpu,
-        features,
+        &features,
         LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
         LLVMRelocMode::LLVMRelocDefault,
         LLVMCodeModel::LLVMCodeModelDefault,

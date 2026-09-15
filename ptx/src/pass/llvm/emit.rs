@@ -357,21 +357,74 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         unsafe { LLVMAddAttributeAtIndex(llvm_object, LLVMAttributeFunctionIndex, attribute) };
     }
 
+    // How many registers a kernel is allowed, and how big a workgroup it must be
+    // able to run with. Both are experiments, both off unless asked for.
+    //
+    // Why they exist: every hot kernel of the DLSS network comes out of the
+    // backend with 96 VGPRs and six to eight hundred registers spilled to
+    // scratch, in the innermost loop. The cause is visible in the metadata --
+    // nothing ever sets amdgpu-flat-work-group-size, so LLVM assumes the
+    // default 1..1024 and has to guarantee the kernel fits with 1024 threads in
+    // a group, which strangles the register budget. The launches are 32 and 256
+    // threads. The compiler is paying for a workgroup size that never happens.
+    //
+    // Neither is turned on by default. amdgpu-flat-work-group-size is a promise
+    // to the backend, not a hint: a kernel compiled for at most N threads and
+    // then launched with more is wrong, and this translation happens before any
+    // launch is seen, so the promise cannot be checked here.
+    fn tuning_experiments(&self, fn_: LLVMValueRef, saw_ntid: bool, max_n_reg: Option<u32>) {
+        // The work group size is the only one of the two that reaches the
+        // backend at all: PTX without .maxntid leaves the default promise of
+        // 1024 threads per group, the backend hands out 96 VGPRs to keep that
+        // promise, and the kernels spill hundreds of values. Promising 256 --
+        // which is the largest block this network ever launches -- raises that
+        // to 256 VGPRs and drops the spilling from 889 values to 29. It does
+        // not make anything faster: three alternated pairs on the hottest
+        // kernel gave 28.6/28.4/27.6 ms against 28.9/29.1/28.8 ms. The scratch
+        // traffic saved and the occupancy lost cancel out.
+        //
+        // amdgpu-waves-per-eu, which asks for the same thing from the other
+        // side, does not change a single byte of the generated code while the
+        // 1024 promise stands, so it was removed rather than left as a switch
+        // that does nothing.
+        if !saw_ntid {
+            if let Ok(size) = std::env::var("ZLUDA_FLAT_WORK_GROUP_SIZE") {
+                let value = format!("1,{}", size.trim());
+                self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
+            }
+        }
+        // PTX .maxnreg says how many 32-bit registers per thread NVIDIA's
+        // compiler was allowed; an AMD VGPR is also 32 bits per lane, so the
+        // number carries over as a ceiling. The network asks for 168, and gets
+        // 96 -- so this raises the ceiling rather than lowering it.
+        if std::env::var_os("ZLUDA_HONOUR_MAXNREG").is_some() {
+            if let Some(registers) = max_n_reg {
+                let value = format!("{registers}");
+                self.emit_fn_attribute_string(fn_, "amdgpu-num-vgpr", &value);
+            }
+        }
+    }
+
     fn emit_tuning(&self, fn_: LLVMValueRef, tuning_directives: &[ast::TuningDirective]) {
+        let mut saw_ntid = false;
+        let mut max_n_reg = None;
         for tuning in tuning_directives {
             match tuning {
                 // We could implement it for the completeness sake, but it's
                 // not particularly important. The functions with .noreturn in
                 // PTX are noreturn in LLVM already
                 ptx_parser::TuningDirective::NoReturn => {}
-                // Not really applicable
-                ptx_parser::TuningDirective::MaxNReg(_) => {}
+                ptx_parser::TuningDirective::MaxNReg(registers) => {
+                    max_n_reg = Some(*registers);
+                }
                 ptx_parser::TuningDirective::MaxNtid(x, y, z) => {
+                    saw_ntid = true;
                     let size = x * y * z;
                     let value = format!("1,{size}");
                     self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
                 }
                 ptx_parser::TuningDirective::ReqNtid(x, y, z) => {
+                    saw_ntid = true;
                     let size = x * y * z;
                     let value = format!("{size},{size}");
                     self.emit_fn_attribute_string(fn_, "amdgpu-flat-work-group-size", &value);
@@ -382,10 +435,17 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 }
             }
         }
+        self.tuning_experiments(fn_, saw_ntid, max_n_reg);
     }
 
     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
-        let value = format!(
+        // Per-function, so it is what the backend actually uses for codegen --
+        // TargetMachine::getSubtargetImpl(F) reads a function's own
+        // "target-features" attribute in preference to the TargetMachine's own
+        // default, so a feature added only there (see ZLUDA_EXTRA_TARGET_FEATURES
+        // in llvm_zluda::compile) never reaches instruction selection or
+        // register allocation.
+        let mut value = format!(
             "+wavefrontsize32,-wavefrontsize64,+cumode{}",
             if cfg!(debug_assertions) {
                 ",+precise-memory"
@@ -393,6 +453,12 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 ""
             }
         );
+        if let Ok(extra) = std::env::var("ZLUDA_EXTRA_TARGET_FEATURES") {
+            if !extra.is_empty() {
+                value.push(',');
+                value.push_str(&extra);
+            }
+        }
         self.emit_fn_attribute_string(fn_, "target-features", &*value)
     }
 

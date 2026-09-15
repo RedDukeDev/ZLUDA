@@ -86,6 +86,34 @@ pub(crate) fn launch_kernel(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> hipError_t {
+    // ZLUDA_FLAT_WORK_GROUP_SIZE promises the backend that no workgroup is
+    // larger than this, which lets it give a kernel far more registers: the
+    // DLSS network's hot kernels go from 96 registers and 610 spilled to 256
+    // and 29. It is a promise and not a hint, and translation happens long
+    // before any launch is seen, so nothing can check it there.
+    //
+    // Breaking it does not corrupt anything: the dispatch is refused and the
+    // driver answers 719, which on its own says nothing about why -- so it is
+    // said here.
+    {
+        static PROMISED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let promised = PROMISED.get_or_init(|| {
+            std::env::var("ZLUDA_FLAT_WORK_GROUP_SIZE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+        });
+        if let Some(limit) = *promised {
+            let threads = block_dim_x
+                .saturating_mul(block_dim_y)
+                .saturating_mul(block_dim_z);
+            if threads > limit {
+                eprintln!(
+                    "[zluda] this kernel was translated with ZLUDA_FLAT_WORK_GROUP_SIZE={limit} and is being launched with {threads} threads per group ({block_dim_x}x{block_dim_y}x{block_dim_z}). The backend was promised the smaller number and gave the kernel registers on that basis, so the driver will refuse the launch. Raise the variable to at least {threads}, or leave it unset."
+                );
+            }
+        }
+    }
+
     // The `extra` form packs every argument into one buffer and describes it
     // with a marker list, instead of passing an array of pointers. CUDA and HIP
     // agree on the markers -- BUFFER_POINTER is 1 and BUFFER_SIZE is 2 in both
