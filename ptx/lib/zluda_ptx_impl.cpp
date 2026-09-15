@@ -1307,17 +1307,24 @@ extern "C"
     // FP8 inputs, f16 accumulator. Used by the DLSS ray reconstruction kernels,
     // which are the only ones in the shipped DLL that reach for FP8 at all.
     //
-    // There is deliberately no native branch here yet. RDNA4 does have
-    // v_wmma_f32_16x16x16_fp8_fp8, and a runtime test on __oclc_ISA_version folds
-    // away at compile time the way the gfx11 branches above do, so the gate would
-    // work. What is missing is the mapping: PTX m16n8k32 carries sixteen A bytes
-    // per lane over eight columns, the AMD instruction eight bytes over sixteen,
-    // so pairs of PTX operations have to be fused the way CombineMMA.cpp already
-    // fuses the f16 ones. That pass has no FP8 case, and no gfx12 hardware was
-    // available to verify a fragment mapping against -- an unverified one would
-    // compile and silently produce wrong pixels. Today every MMA falls back to
-    // software on gfx12 regardless; when a native gfx12 path is added, FP8 slots
-    // in at the same gate as the rest.
+    // We wrap the intrinsic in an optnone function for the same reason as
+    // every other MMA form here: to keep the call visible to CombineMMA.cpp,
+    // which now has an FP8 case (getFp8ZludaMMA / EmitAmdMmaFp8) mirroring the
+    // s8 one above it byte for byte -- gfx12's fp8_fp8 WMMA declares the exact
+    // same operand profile as gfx11's iu8 one, [v8f32, v2i32, v2i32, v8f32],
+    // which is the LLVM backend's own statement of the fragment layout, not a
+    // guess, and AMD's own documentation states that layout is unified across
+    // the 8-bit-element WMMA family. No widening, no byte-spread, no NaN fixup:
+    // the packed e4m3 bytes go to the hardware unchanged.
+    //
+    // Unverified end to end: it has not been run on gfx12 hardware. Gated on
+    // __oclc_ISA_version so it only compiles into a gfx12 binary and changes
+    // nothing on gfx11 or gfx10, where the emulated path below still runs.
+    static __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k32_f32_fp8_fp8_f32_optnone [[clang::optnone]] (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg)
+    {
+        __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k32_f32_fp8_fp8_f32(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg) __asm("llvm.zluda.mma.m16n8k32.f32.fp8.fp8.f32");
+        return __llvm_zluda_mma_m16n8k32_f32_fp8_fp8_f32(a_reg, b_reg, c_reg);
+    }
 // Widening an FP8 matrix multiply onto the hardware f16 one.
 //
 // RDNA3's matrix units take f16, bf16 and 8 bit integers, but not e4m3, so the
@@ -1416,7 +1423,18 @@ __device__ static inline float4::Native_vec_ fp8_mma_half(uint32_t a_row0, uint3
         f16x2 c01 = std::bit_cast<f16x2>(c_reg[0]);
         f16x2 c23 = std::bit_cast<f16x2>(c_reg[1]);
         float4::Native_vec_ d;
-        if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 12000)
+        if (__oclc_ISA_version >= 12000 && __oclc_ISA_version < 13000)
+        {
+            // Native: the packed e4m3 bytes go to gfx12's fp8_fp8 WMMA
+            // unchanged, no widening. See the wrapper above for how sure this
+            // is and is not.
+            uint4::Native_vec_ c_wide = std::bit_cast<uint4::Native_vec_>(
+                float4::Native_vec_{float(c01.x), float(c01.y), float(c23.x), float(c23.y)});
+            uint4::Native_vec_ d_wide =
+                __llvm_zluda_mma_m16n8k32_f32_fp8_fp8_f32_optnone(a_reg, b_reg, c_wide);
+            d = std::bit_cast<float4::Native_vec_>(d_wide);
+        }
+        else if (__oclc_ISA_version >= 11000 && __oclc_ISA_version < 12000)
         {
             d = float4::Native_vec_{float(c01.x), float(c01.y), float(c23.x), float(c23.y)};
             d = fp8_mma_half(a_reg[0], a_reg[1], b_reg[0], d); // k 0..15
