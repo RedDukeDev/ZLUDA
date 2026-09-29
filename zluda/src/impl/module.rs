@@ -335,6 +335,12 @@ pub(crate) fn load_hip_module(
 #[derive(serde::Serialize)]
 struct ExtraCacheAttributes {
     is_debug: bool,
+    // Left out of the cache key. The clock rate only scales nanosleep, so a
+    // module built on one card runs correctly on another; keyed by it, a cache
+    // shipped already full would only ever be found on cards that report the
+    // exact clock of the one that built it, and every other card in the
+    // family would translate everything again.
+    #[serde(skip)]
     clock_rate: u32,
 }
 
