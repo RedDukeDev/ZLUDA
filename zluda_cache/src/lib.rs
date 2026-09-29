@@ -60,8 +60,16 @@ impl ModuleCache {
         // the only sign anything went wrong, because there is no record it
         // ever happened. 30 seconds is generous next to how rarely two writes
         // actually land in the same instant.
+        //
+        // It is set before anything else touches the file. Setting the journal
+        // mode and running the migrations both take locks, and with the
+        // timeout still at zero, opening the cache while another process
+        // records a hit failed at once. The caller then has no cache at all: it
+        // translates a module that was cached, and cannot store the result
+        // either. Sixteen processes loading a warm cache together did exactly
+        // that to one module or another on every start.
         conn.batch_execute(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 30000;",
+            "PRAGMA busy_timeout = 30000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;",
         )
         .ok()?;
         conn.run_pending_migrations(MIGRATIONS).ok()?;
