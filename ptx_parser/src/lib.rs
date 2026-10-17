@@ -3621,9 +3621,10 @@ derive_parser!(
     fence.fence_sem.fence_scope => {
         ast::Instruction::Membar { data: fence_scope }
     }
-    // Only the form the modules actually contain; a typeless modifier with
-    // several alternatives is not something the generator accepts.
-    .fence_sem =              { .release };
+    // acquire and acq_rel as well as release: version 310.9.16 of the network has
+    // `fence.acquire.gpu` in its chained kernels, and a function with a statement
+    // this does not know is dropped, not reported.
+    .fence_sem: AtomSemantics = { .acquire, .release, .acq_rel };
     .fence_scope: MemScope =  { .cta, .cluster, .gpu, .sys };
 
     atom{.sem}{.scope}{.space}.op{.level::cache_hint}.type                                      d, [a], b{, cache_policy} => {
@@ -5014,6 +5015,26 @@ mod tests {
             errors[1],
             PtxError::UnrecognizedStatement("unknown_op2 temp2, temp;")
         ));
+    }
+
+    #[test]
+    fn fence_with_every_semantics_is_recognised() {
+        for sem in ["acquire", "release", "acq_rel"] {
+            let text = format!(
+                "
+            .version 8.7
+            .target sm_120
+            .address_size 64
+
+            .visible .entry fenced(
+            )
+            {{
+                fence.{sem}.gpu;
+                ret;
+            }}"
+            );
+            parse_module_checked(&text).unwrap_or_else(|errors| panic!("fence.{sem}.gpu: {errors:?}"));
+        }
     }
 
     #[test]
