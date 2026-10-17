@@ -234,7 +234,7 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
 
     fn vec_pack(
         &mut self,
-        vector_elements: Vec<ast::RegOrImmediate<SpirvWord>>,
+        vector_elements: Vec<Option<ast::RegOrImmediate<SpirvWord>>>,
         type_space: Option<(&ast::Type, ast::StateSpace)>,
         is_dst: bool,
         relaxed_type_check: bool,
@@ -254,16 +254,15 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
         let vector_elements = vector_elements
             .into_iter()
             .map(|element| match element {
-                ast::RegOrImmediate::Reg(name) => self.reg(name),
-                ast::RegOrImmediate::Imm(immediate_value) => self.immediate(
-                    immediate_value,
-                    Some((&ast::Type::Scalar(scalar_t), state_space)),
-                ),
-                // A discarded element still occupies its position in the
-                // vector, so it needs a register -- just one nothing reads.
-                ast::RegOrImmediate::Sink => Ok(self
-                    .resolver
-                    .register_unnamed(Some((ast::Type::Scalar(scalar_t), state_space)))),
+                Some(ast::RegOrImmediate::Reg(name)) => self.reg(name).map(Some),
+                Some(ast::RegOrImmediate::Imm(immediate_value)) => self
+                    .immediate(
+                        immediate_value,
+                        Some((&ast::Type::Scalar(scalar_t), state_space)),
+                    )
+                    .map(Some),
+                None if is_dst => Ok(None),
+                None => Err(error_mismatched_type()),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let temporary_vector = self

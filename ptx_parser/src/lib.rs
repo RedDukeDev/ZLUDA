@@ -382,7 +382,6 @@ fn reg_or_immediate<'a, 'input>(
     trace(
         "reg_or_immediate",
         alt((
-            Token::Underscore.value(ast::RegOrImmediate::Sink),
             immediate_value.map(|imm| ast::RegOrImmediate::Imm(imm)),
             ident.map(|id| ast::RegOrImmediate::Reg(id)),
         )),
@@ -976,7 +975,8 @@ fn method_parameter<'a, 'input: 'a>(
                 ident,
             ),
         )
-        .map(|(vector, type_, _, align, name)| ((align, vector, type_), name))
+        // The alignment after .ptr is that of the data pointed to, not of the parameter.
+        .map(|(vector, type_, _, _, name)| ((None, vector, type_), name))
         .parse_next(stream)
     }
     trace(
@@ -1517,10 +1517,14 @@ impl<Ident> ast::ParsedOperand<Ident> {
         }
         fn vector_operand<'a, 'input>(
             stream: &mut PtxParser<'a, 'input>,
-        ) -> PResult<Vec<ast::RegOrImmediate<&'input str>>> {
+        ) -> PResult<Vec<Option<ast::RegOrImmediate<&'input str>>>> {
             delimited(
                 Token::LBrace,
-                separated(1..=8, reg_or_immediate, Token::Comma),
+                separated(
+                    1..=8,
+                    alt((Token::Sink.value(None), reg_or_immediate.map(Some))),
+                    Token::Comma,
+                ),
                 Token::RBrace,
             )
             .parse_next(stream)
@@ -1529,7 +1533,7 @@ impl<Ident> ast::ParsedOperand<Ident> {
             "operand",
             alt((
                 // Before the identifier rules: `_` is the sink, not a name.
-                Token::Underscore.value(ast::ParsedOperand::Sink),
+                Token::Sink.value(ast::ParsedOperand::Sink),
                 trace("ident_operands", ident_operands),
                 immediate_value.map(ast::ParsedOperand::Imm),
                 trace(
@@ -1944,14 +1948,10 @@ derive_parser!(
         Semicolon,
         #[token("@")]
         At,
-        // The sink, `_`. The identifier rule below deliberately requires a
-        // character after a leading underscore, so a bare one needs its own
-        // token; without it a `mov.b64 {%r1, _}, %rd1` fails to parse and takes
-        // the whole module with it.
-        #[token("_")]
-        Underscore,
         #[regex(r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
         Ident(&'input str),
+        #[token("_")]
+        Sink,
         #[regex(r"\.[a-zA-Z][a-zA-Z0-9_$]*|\.[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
         DotIdent(&'input str),
         #[regex(r#""[^"]*""#)]
@@ -4825,6 +4825,51 @@ mod tests {
     use winnow::prelude::*;
 
     #[test]
+    fn sink_is_not_an_identifier() {
+        let tokens = Token::lexer("_ _reg __ %r1")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Sink,
+                Token::Ident("_reg"),
+                Token::Ident("__"),
+                Token::Ident("%r1")
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_operand_preserves_sink_positions() {
+        let text = "{_, %r1, _, 7}";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let operand = crate::ParsedOperand::<&str>::parse.parse(stream).unwrap();
+        let crate::ParsedOperand::VecPack(ref elements) = operand else {
+            panic!("expected a vector operand");
+        };
+        assert_eq!(
+            elements,
+            &vec![
+                None,
+                Some(crate::RegOrImmediate::Reg("%r1")),
+                None,
+                Some(crate::RegOrImmediate::Imm(crate::ImmediateValue::S64(7))),
+            ]
+        );
+        assert_eq!(operand.to_string(), text);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
     fn first_optional_present() {
         let text = "AB";
         let result = first_optional::<_, _, _, (), _, _>('A', 'B').parse(text);
@@ -4919,6 +4964,17 @@ mod tests {
         };
         assert!(target.parse(stream).is_err());
         assert_eq!(errors.len(), 0);
+    }
+
+    #[test]
+    fn ptr_param_alignment_is_the_pointees() {
+        let text = ".version 7.0\n.target sm_80\n.address_size 64\n.visible .entry k(.param .u8 a, .param .u64 .ptr .global .align 1 p)\n{\n\tret;\n}\n";
+        let module = super::parse_module_checked(text).unwrap();
+        let [super::ast::Directive::Method(_, method)] = &module.directives[..] else {
+            panic!()
+        };
+        let params = &method.func_directive.input_arguments;
+        assert_eq!((params[1].name, params[1].info.align), ("p", None));
     }
 
     #[test]

@@ -1261,22 +1261,21 @@ where
                 (self)(ident, type_space, is_dst, relaxed_type_check)?,
                 index,
             ),
-            ParsedOperand::VecPack(vec) => ParsedOperand::VecPack(
-                vec.into_iter()
-                    .map(|reg_or_immediate| {
-                        Ok(match reg_or_immediate {
-                            RegOrImmediate::Reg(ident) => RegOrImmediate::Reg((self)(
-                                ident,
-                                type_space,
-                                is_dst,
-                                relaxed_type_check,
-                            )?),
-                            RegOrImmediate::Imm(imm) => RegOrImmediate::Imm(imm),
-                            RegOrImmediate::Sink => RegOrImmediate::Sink,
+            ParsedOperand::VecPack(vec) => {
+                ParsedOperand::VecPack(
+                    vec.into_iter()
+                        .map(|element| {
+                            Ok(match element {
+                                Some(RegOrImmediate::Reg(ident)) => Some(RegOrImmediate::Reg(
+                                    (self)(ident, type_space, is_dst, relaxed_type_check)?,
+                                )),
+                                Some(RegOrImmediate::Imm(imm)) => Some(RegOrImmediate::Imm(imm)),
+                                None => None,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
         })
     }
 
@@ -1748,11 +1747,6 @@ pub struct ShfDetails {
 pub enum RegOrImmediate<Ident> {
     Reg(Ident),
     Imm(ImmediateValue),
-    // The sink, written `_`. Inside a vector destination it means "discard this
-    // element": `mov.b64 {%r1, _}, %rd1` keeps only the low half. It is a
-    // destination, never a source, and carries no name to resolve, so it is
-    // kept distinct from a register rather than invented as one.
-    Sink,
 }
 
 #[derive(Clone)]
@@ -1761,7 +1755,8 @@ pub enum ParsedOperand<Ident> {
     RegOffset(Ident, i32),
     Imm(ImmediateValue),
     VecMember(Ident, u8),
-    VecPack(Vec<RegOrImmediate<Ident>>),
+    // None denotes a sink; retain its position in the vector.
+    VecPack(Vec<Option<RegOrImmediate<Ident>>>),
     // The sink, `_`, as a whole operand rather than as a vector element:
     // `elect.sync _|%p, %r` discards the elected lane and keeps only the
     // predicate. Like the vector form it is a destination and carries no name.
@@ -1803,7 +1798,10 @@ where
                     if idx != 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", item)?;
+                    match item {
+                        Some(item) => write!(f, "{}", item)?,
+                        None => f.write_char('_')?,
+                    }
                 }
                 f.write_char('}')?
             }
