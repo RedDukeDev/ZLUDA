@@ -42,6 +42,11 @@ pub const LLVMZludaFastMathAll: ::std::ffi::c_uint = LLVMZludaFastMathAllowReass
 pub type LLVMZludaFastMathFlags = std::ffi::c_uint;
 
 extern "C" {
+    /// See LLVMZludaRecoverPointerProvenance in lib.cpp.
+    pub fn LLVMZludaRecoverPointerProvenance(M: LLVMModuleRef) -> u32;
+    /// See LLVMZludaInlineImageHelpers in lib.cpp.
+    pub fn LLVMZludaInlineImageHelpers(M: LLVMModuleRef) -> u32;
+
     pub fn LLVMZludaBuildAlloca(
         B: LLVMBuilderRef,
         Ty: LLVMTypeRef,

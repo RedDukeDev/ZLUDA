@@ -73,6 +73,70 @@ pub(crate) fn get_attribute(
     Ok(())
 }
 
+
+// ZLUDA_DEBUG_BUFFERS=1: after every launch, a summary of each allocation the kernel's arguments point
+// into (how much of it is not zero, the mean magnitude read as half floats), to find the first kernel
+// whose output is wrong.
+unsafe fn debug_buffers(arguments: &[u8], grid: (u32, u32, u32), block: (u32, u32, u32)) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let number = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    if let Ok(global_state) = super::driver::global_state() {
+        if let Ok(allocations) = global_state.allocations.lock() {
+            for word in arguments.chunks_exact(8) {
+                let value = u64::from_le_bytes(word.try_into().unwrap()) as usize;
+                if value < 0x10000 {
+                    continue;
+                }
+                if let Some((offset, info)) = allocations.get_offset_and_info(value) {
+                    let base = value - offset;
+                    if !seen.iter().any(|(b, _)| *b == base) {
+                        seen.push((base, info.size));
+                    }
+                }
+            }
+        }
+    }
+    hipDeviceSynchronize();
+    let mut line = format!(
+        "[zluda buf] #{} grid {},{},{} block {},{},{}:",
+        number, grid.0, grid.1, grid.2, block.0, block.1, block.2
+    );
+    for (base, size) in seen {
+        let bytes = size.min(8 << 20) & !1;
+        if bytes == 0 {
+            continue;
+        }
+        let mut data = vec![0u8; bytes];
+        if hipMemcpyDtoH(data.as_mut_ptr().cast(), hipDeviceptr_t(base as *mut _), bytes) != hipError_t::Success {
+            continue;
+        }
+        let mut nonzero = 0usize;
+        let mut magnitude = 0f64;
+        let words = bytes / 2;
+        for w in data.chunks_exact(2) {
+            let h = u16::from_le_bytes([w[0], w[1]]);
+            if h != 0 {
+                nonzero += 1;
+                let exp = ((h >> 10) & 31) as i32;
+                if exp != 31 {
+                    let mant = (h & 1023) as f64;
+                    magnitude += if exp == 0 { mant / 1024.0 * 2f64.powi(-14) } else { (1.0 + mant / 1024.0) * 2f64.powi(exp - 15) };
+                }
+            }
+        }
+        line.push_str(&format!(
+            " [{:x}+{}K nz={:.1}% mag={:.4}]",
+            base & 0xffffff,
+            size >> 10,
+            100.0 * nonzero as f64 / words as f64,
+            magnitude / words as f64
+        ));
+    }
+    eprintln!("{}", line);
+}
+
 pub(crate) fn launch_kernel(
     f: &Function,
     grid_dim_x: ::core::ffi::c_uint,
@@ -152,7 +216,7 @@ pub(crate) fn launch_kernel(
         translated.push(0x03 as *mut ::core::ffi::c_void);
         translated.as_mut_ptr()
     };
-    unsafe {
+    let result = unsafe {
         hipModuleLaunchKernel(
             f.base,
             grid_dim_x,
@@ -166,7 +230,51 @@ pub(crate) fn launch_kernel(
             kernel_params,
             extra,
         )
+    };
+    if std::env::var_os("ZLUDA_DEBUG_BUFFERS").is_some() {
+        let mut arguments: &[u8] = &[];
+        if !extra.is_null() {
+            unsafe {
+                let mut i = 0;
+                let mut data: *const u8 = std::ptr::null();
+                let mut length = 0usize;
+                while i < 16 {
+                    let marker = *extra.add(i) as usize;
+                    if marker == 0 || marker == 3 {
+                        break;
+                    }
+                    let value = *extra.add(i + 1);
+                    if marker == 1 {
+                        data = value as *const u8;
+                    } else if marker == 2 {
+                        length = *(value as *const usize);
+                    }
+                    i += 2;
+                }
+                if !data.is_null() {
+                    arguments = std::slice::from_raw_parts(data, length);
+                }
+            }
+        }
+        unsafe {
+            debug_buffers(
+                arguments,
+                (grid_dim_x, grid_dim_y, grid_dim_z),
+                (block_dim_x, block_dim_y, block_dim_z),
+            );
+        }
     }
+    if std::env::var_os("ZLUDA_DEBUG_ARRAYS").is_some() {
+        unsafe {
+            hipDeviceSynchronize();
+            eprint!(
+                "[zluda launch] grid {},{},{} block {},{},{} -> {:?}  ",
+                grid_dim_x, grid_dim_y, grid_dim_z, block_dim_x, block_dim_y, block_dim_z, result
+            );
+            super::array::debug_report();
+        }
+    }
+    result
 }
 
 pub(crate) unsafe fn set_attribute(

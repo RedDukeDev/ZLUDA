@@ -95,6 +95,14 @@ fn insert_implicit_conversions_impl<'input>(
                 data.type_ = ast::TexType::Texobj;
             }
         }
+        ExpandedStatement::Instruction(ast::Instruction::Suld {
+            ref mut data,
+            ref arguments,
+        }) => {
+            if object_operand(resolver, arguments.src_ptr)? {
+                data.type_ = ast::TexType::Texobj;
+            }
+        }
         _ => {}
     }
     let statement = stmt.visit_map::<SpirvWord, TranslateError>(

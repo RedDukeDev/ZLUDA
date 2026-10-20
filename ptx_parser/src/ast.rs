@@ -499,7 +499,7 @@ ptx_parser_macros::generate_instruction_type!(
             }
         },
         Ex2 {
-            type: Type::Scalar(ScalarType::F32),
+            type: { Type::from(data.type_) },
             data: TypeFtz,
             arguments<T>: {
                 dst: T,
@@ -1092,6 +1092,40 @@ ptx_parser_macros::generate_instruction_type!(
                     repr: T,
                     type: { data.value_type() },
                     relaxed_type_check: true,
+                },
+            }
+        },
+        Suld {
+            type: !,
+            data: SustData,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: { data.value_type() },
+                    relaxed_type_check: true,
+                },
+                src_ptr: {
+                    repr: T,
+                    type: {
+                        if data.type_ == TexType::Texref {
+                            Type::Texref
+                        } else {
+                            Type::Scalar(ScalarType::U64)
+                        }
+                    },
+                    space: {
+                        if data.type_ == TexType::Texref {
+                            StateSpace::Global
+                        } else {
+                            StateSpace::Reg
+                        }
+                    },
+
+                },
+                src_coord: {
+                    repr: T,
+                    type: { data.coord_type() },
+
                 },
             }
         },
@@ -2612,6 +2646,8 @@ pub enum CvtMode {
         flush_to_zero: Option<bool>,
         saturate: bool,
         relu: bool,
+        // .satfinite: an overflow gives the largest finite value instead of infinity
+        satfinite: bool,
     },
     FPRound {
         integer_rounding: Option<RoundingMode>,
@@ -2690,6 +2726,7 @@ impl CvtDetails {
                         flush_to_zero,
                         saturate,
                         relu,
+                        satfinite: false,
                     }
                 }
                 Ordering::Equal => CvtMode::FPRound {

@@ -13,6 +13,9 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Transforms/Utils/SplitModule.h>
+#include <llvm/IR/Operator.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/ADT/SmallVector.h>
 #pragma GCC diagnostic pop
 
 #include <mutex>
@@ -337,3 +340,102 @@ bool LLVMZludaParseCommandLineOptions(int argc, const char *const *argv,
 }
 
 LLVM_C_EXTERN_C_END
+
+// PTX that takes a kernel parameter's address (mov.b64 %rd, param; ld.param
+// [%rd+N]) reaches LLVM as inttoptr(ptrtoint(addrspacecast(kernarg)) + N):
+// a flat pointer whose origin the integer round trip hides, so the loads are
+// flat loads that the backend treats as divergent (texture handles read that
+// way force a readfirstlane waterfall around every image instruction). This
+// rewrites inttoptr(ptrtoint(P) + offsets) into a GEP on P, the same address
+// with P's provenance, so infer-address-spaces can turn such loads back into
+// constant-address-space loads. Returns the number of rewrites.
+namespace
+{
+static Value *provenanceBase(Value *V, SmallVectorImpl<Value *> &Offsets, unsigned Depth)
+{
+    if (Depth > 8)
+        return nullptr;
+    if (auto *Cast = dyn_cast<PtrToIntInst>(V))
+        return Cast->getType()->isIntegerTy(64) ? Cast->getPointerOperand() : nullptr;
+    auto *Binary = dyn_cast<BinaryOperator>(V);
+    if (Binary == nullptr)
+        return nullptr;
+    const bool IsAdd = Binary->getOpcode() == Instruction::Add;
+    const bool IsDisjointOr = Binary->getOpcode() == Instruction::Or && cast<PossiblyDisjointInst>(Binary)->isDisjoint();
+    if (!IsAdd && !IsDisjointOr)
+        return nullptr;
+    for (unsigned Side = 0; Side < 2; ++Side)
+    {
+        SmallVector<Value *, 4> Nested;
+        if (Value *Base = provenanceBase(Binary->getOperand(Side), Nested, Depth + 1))
+        {
+            Offsets.append(Nested.begin(), Nested.end());
+            Offsets.push_back(Binary->getOperand(1 - Side));
+            return Base;
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
+extern "C" unsigned LLVMZludaRecoverPointerProvenance(LLVMModuleRef ModuleRef)
+{
+    Module *M = unwrap(ModuleRef);
+    unsigned Rewritten = 0;
+    for (Function &F : *M)
+    {
+        SmallVector<IntToPtrInst *, 32> Casts;
+        for (Instruction &I : instructions(F))
+            if (auto *Cast = dyn_cast<IntToPtrInst>(&I))
+                Casts.push_back(Cast);
+        for (IntToPtrInst *Cast : Casts)
+        {
+            SmallVector<Value *, 4> Offsets;
+            Value *Base = provenanceBase(Cast->getOperand(0), Offsets, 0);
+            if (Base == nullptr || !Base->getType()->isPointerTy())
+                continue;
+            IRBuilder<> Builder(Cast);
+            Value *Offset = nullptr;
+            for (Value *Part : Offsets)
+            {
+                Value *Wide = Builder.CreateSExtOrTrunc(Part, Builder.getInt64Ty());
+                Offset = Offset == nullptr ? Wide : Builder.CreateAdd(Offset, Wide);
+            }
+            Value *Pointer = Offset == nullptr ? Base : Builder.CreateGEP(Builder.getInt8Ty(), Base, Offset);
+            if (Pointer->getType() != Cast->getType())
+                Pointer = Builder.CreateAddrSpaceCast(Pointer, Cast->getType());
+            Cast->replaceAllUsesWith(Pointer);
+            Cast->eraseFromParent();
+            ++Rewritten;
+        }
+    }
+    return Rewritten;
+}
+
+// Device-library image wrappers (__llvm_amdgcn_image_*, called by ZLUDA's texture/surface
+// helpers) were left as calls: their FP attributes did not match the strictfp kernels, so the
+// inliner refused them. Each call then began with a full s_waitcnt and a readfirstlane
+// waterfall over the (actually uniform) resource descriptor. The wrappers contain no FP math,
+// so give them the caller-compatible "dynamic" denormal mode and strictfp, and force inlining.
+extern "C" unsigned LLVMZludaInlineImageHelpers(LLVMModuleRef ModuleRef)
+{
+    Module* M = unwrap(ModuleRef);
+    unsigned Changed = 0;
+    for (Function& F : *M)
+    {
+        const StringRef N = F.getName();
+        if (F.isDeclaration() || !N.starts_with("__llvm_amdgcn_image_"))
+            continue;
+        F.removeFnAttr(Attribute::NoInline);
+        F.removeFnAttr(Attribute::OptimizeNone);
+        F.addFnAttr(Attribute::AlwaysInline);
+        F.addFnAttr("denormal-fp-math", "dynamic,dynamic");
+        F.addFnAttr("denormal-fp-math-f32", "dynamic,dynamic");
+        F.addFnAttr(Attribute::StrictFP); // no FP math inside
+        for (User* U : F.users())
+            if (auto* CB = dyn_cast<CallBase>(U))
+                CB->removeFnAttr(Attribute::NoInline);
+        ++Changed;
+    }
+    return Changed;
+}

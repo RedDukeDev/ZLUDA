@@ -15,6 +15,14 @@ use std::sync::Mutex;
 // HIP_RESOURCE_DESC is reserved.
 static TEXTURE_DESCS: Mutex<Option<HashMap<usize, (u32, usize)>>> = Mutex::new(None);
 
+// The texture object made last over each array, for a surface object made after it: see surf.rs, where
+// the order of the two decides which sampler a surface ends up with.
+static LAST_TEXTURE_OVER: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+pub(crate) fn last_texture_over(array: usize) -> Option<usize> {
+    LAST_TEXTURE_OVER.lock().ok()?.as_ref()?.get(&array).copied()
+}
+
 pub(crate) unsafe fn object_create(
     p_tex_object: *mut hipTextureObject_t,
     p_res_desc: *const HIP_RESOURCE_DESC,
@@ -22,6 +30,35 @@ pub(crate) unsafe fn object_create(
     p_res_view_desc: *const HIP_RESOURCE_VIEW_DESC,
 ) -> hipError_t {
     hipTexObjectCreate(p_tex_object, p_res_desc, p_tex_desc, p_res_view_desc)?;
+    if std::env::var_os("ZLUDA_DEBUG_TEX").is_some() {
+        if let (Some(res), Some(tex)) = (p_res_desc.as_ref(), p_tex_desc.as_ref()) {
+            eprintln!(
+                "[zluda tex] object {:#x} resType={} flags={:#x} address=[{},{},{}] filter={} mipFilter={} readView={}",
+                *p_tex_object as usize,
+                res.resType.0,
+                tex.flags,
+                tex.addressMode[0].0,
+                tex.addressMode[1].0,
+                tex.addressMode[2].0,
+                tex.filterMode.0,
+                tex.mipmapFilterMode.0,
+                !p_res_view_desc.is_null(),
+            );
+            let mut page = [0u8; 64];
+            if hipMemcpyDtoH(
+                page.as_mut_ptr().cast(),
+                hipDeviceptr_t(*p_tex_object as *mut _),
+                64,
+            ) == hipError_t::Success
+            {
+                let words: Vec<String> = page
+                    .chunks(4)
+                    .map(|w| format!("{:08X}", u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+                    .collect();
+                eprintln!("[zluda tex]   page: {}", words.join(" "));
+            }
+        }
+    }
     if let Some(desc) = p_res_desc.as_ref() {
         // Only the array forms carry a handle worth recording; a texture over
         // linear or pitched memory keeps its type and reports a null resource,
@@ -42,6 +79,15 @@ pub(crate) unsafe fn object_create(
         // a `tex` through one has to sample with something: this is the
         // sampling the program asked for, so it is the right thing to give it.
         // See the note in surf.rs for what happens without it.
+        if std::env::var_os("ZLUDA_DEBUG_TEX").is_some() {
+            eprintln!("[zluda tex] texture {:#x} created over array {:#x}", *p_tex_object as usize, handle);
+        }
+        if handle != 0 {
+            if let Ok(mut last) = LAST_TEXTURE_OVER.lock() {
+                last.get_or_insert_with(HashMap::new)
+                    .insert(handle, *p_tex_object as usize);
+            }
+        }
         super::surf::adopt_sampler(handle, *p_tex_object as usize);
     }
     Ok(())
@@ -71,6 +117,11 @@ pub(crate) unsafe fn object_get_resource_desc(
 }
 
 pub(crate) unsafe fn object_destroy(tex_object: hipTextureObject_t) -> hipError_t {
+    if let Ok(mut last) = LAST_TEXTURE_OVER.lock() {
+        if let Some(last) = last.as_mut() {
+            last.retain(|_, object| *object != tex_object as usize);
+        }
+    }
     if let Ok(mut descs) = TEXTURE_DESCS.lock() {
         if let Some(descs) = descs.as_mut() {
             descs.remove(&(tex_object as usize));

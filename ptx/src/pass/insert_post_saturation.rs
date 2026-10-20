@@ -231,6 +231,7 @@ fn run_instruction<'input>(
         | ast::Instruction::Dp2a { .. }
         | ast::Instruction::Tex { .. }
         | ast::Instruction::Sust { .. }
+        | ast::Instruction::Suld { .. }
         | ast::Instruction::MovMatrix { .. }
         | ast::Instruction::WmmaMma { .. }
         | ast::Instruction::Mma { .. }

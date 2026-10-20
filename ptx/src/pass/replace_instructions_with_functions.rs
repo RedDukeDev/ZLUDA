@@ -394,6 +394,37 @@ fn run_instruction<'input>(
             );
             to_call(resolver, fn_declarations, name.into(), i)?
         }
+        i @ ptx_parser::Instruction::Suld {
+            data:
+                ast::SustData {
+                    type_,
+                    dims,
+                    formatted: _,
+                    vector,
+                    scalar_type,
+                    clamp: _,
+                },
+            ..
+        } => {
+            let name = format!(
+                "{prefix}_b_{dims}_{vector}{scalar}",
+                prefix = match type_ {
+                    ast::TexType::Texref => "suldref",
+                    ast::TexType::Texobj => "suldobj",
+                },
+                dims = match dims {
+                    ast::TexDimensions::D1 => "1d",
+                    ast::TexDimensions::D2 => "2d",
+                    ast::TexDimensions::D3 => "3d",
+                },
+                vector = match vector {
+                    Some(n) => format!("v{}_", n.get()),
+                    None => String::new(),
+                },
+                scalar = scalar_to_ptx_name(scalar_type),
+            );
+            to_call(resolver, fn_declarations, name.into(), i)?
+        }
         i @ ptx_parser::Instruction::Tex {
             data:
                 ast::TexData {
@@ -705,6 +736,34 @@ fn run_instruction<'input>(
                 resolver,
                 fn_declarations,
                 format!("cvt_rn_satfinite_{relu}{to}_f16x2").into(),
+                i,
+            )?
+        }
+        // cvt.rn.satfinite to a 16 bit float: the plain truncation overflows to infinity,
+        // so the value is clamped to the largest finite one first.
+        i @ ptx_parser::Instruction::Cvt {
+            data:
+                ast::CvtDetails {
+                    from: ast::ScalarType::F32,
+                    to: to @ (ast::ScalarType::F16 | ast::ScalarType::BF16),
+                    mode:
+                        ast::CvtMode::FPTruncate {
+                            satfinite: true,
+                            relu: false,
+                            ..
+                        },
+                },
+            arguments: _,
+        } => {
+            let to = match to {
+                ptx_parser::ScalarType::F16 => "f16",
+                ptx_parser::ScalarType::BF16 => "bf16",
+                _ => unreachable!(),
+            };
+            to_call(
+                resolver,
+                fn_declarations,
+                format!("cvt_rn_satfinite_{to}_f32").into(),
                 i,
             )?
         }

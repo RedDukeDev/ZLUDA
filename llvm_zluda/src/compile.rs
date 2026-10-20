@@ -164,6 +164,18 @@ fn make_target_machine(gcn_arch: &str) -> Result<TargetMachine, String> {
     ))
 }
 
+/// Whether computed kernel-parameter addresses get their address space back after
+/// optimisation (ZLUDA_PARAM_PROVENANCE=0 turns it off). Part of the module cache key.
+pub fn param_provenance_enabled() -> bool {
+    std::env::var("ZLUDA_PARAM_PROVENANCE").map_or(true, |value| value.trim() != "0")
+}
+
+/// Whether the device-library image wrappers are inlined (ZLUDA_INLINE_IMAGE=0 turns it off).
+/// Part of the module cache key.
+pub fn inline_image_enabled() -> bool {
+    std::env::var("ZLUDA_INLINE_IMAGE").map_or(true, |value| value.trim() != "0")
+}
+
 fn run_optimizer(module: &Module, target_machine: &TargetMachine) -> Result<(), String> {
     let pb_options = PassBuilderOptions::new();
     let error = unsafe {
@@ -178,6 +190,24 @@ fn run_optimizer(module: &Module, target_machine: &TargetMachine) -> Result<(), 
         let err_msg = unsafe { llvm_sys::error::LLVMGetErrorMessage(error) };
         let message = Message::new(unsafe { CStr::from_ptr(err_msg) });
         return Err(message.to_str().to_string());
+    }
+    // Loads through computed kernel-parameter addresses become constant
+    // address space loads again (see LLVMZludaRecoverPointerProvenance), which
+    // keeps texture handles uniform. ZLUDA_PARAM_PROVENANCE=0 turns it off.
+    if param_provenance_enabled() && unsafe { crate::ffi::LLVMZludaRecoverPointerProvenance(module.get()) } != 0 {
+        let error = unsafe {
+            LLVMRunPasses(
+                module.get(),
+                c"function(infer-address-spaces,instcombine,simplifycfg)".as_ptr(),
+                target_machine.get(),
+                pb_options.get(),
+            )
+        };
+        if !error.is_null() {
+            let err_msg = unsafe { llvm_sys::error::LLVMGetErrorMessage(error) };
+            let message = Message::new(unsafe { CStr::from_ptr(err_msg) });
+            return Err(message.to_str().to_string());
+        }
     }
     Ok(())
 }
@@ -352,6 +382,12 @@ pub fn compile(
     linked.link(ockl)?;
 
     linked.verify()?;
+    // The device-library image wrappers must be inlined or every texture
+    // access starts with a full wait and a waterfall over its descriptor.
+    // ZLUDA_INLINE_IMAGE=0 turns it off.
+    if inline_image_enabled() {
+        unsafe { crate::ffi::LLVMZludaInlineImageHelpers(linked.get()) };
+    }
     phase("link");
 
     if let Some(hook) = compiler_hook {

@@ -2711,8 +2711,14 @@ derive_parser!(
     call <= { call(stream) }
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cvt
-    cvt{.ifrnd}{.ftz}{.sat}.dtype.atype         d, a => {
-        let data = ast::CvtDetails::new(&mut state.errors, ifrnd, ftz, sat, false, dtype, atype);
+    cvt{.ifrnd}{.ftz}{.sat}{.satfinite}.dtype.atype         d, a => {
+        let mut data = ast::CvtDetails::new(&mut state.errors, ifrnd, ftz, sat, false, dtype, atype);
+        if satfinite {
+            match data.mode {
+                ast::CvtMode::FPTruncate { satfinite: ref mut flag, .. } => *flag = true,
+                _ => state.errors.push(PtxError::Todo("cvt.satfinite other than a float truncation".to_string())),
+            }
+        }
         let arguments = ast::CvtArgs { dst: d, src: a, src2: None };
         ast::Instruction::Cvt {
             data, arguments
@@ -3609,6 +3615,22 @@ derive_parser!(
             arguments: RedVectorArgs { src_address: a, src_values: b }
         }
     }
+    // The scalar integer reduction, e.g. red.release.gpu.add.s32 [a], 1 (the network's
+    // chained kernels signal completion with it). The same operation as an atom whose
+    // result nobody reads, so it goes through the same emitter as the vector one.
+    red{.red_sem}{.red_scope}{.global}.add.red_int_type  [a], b => {
+        ast::Instruction::RedVector {
+            data: ast::RedVectorDetails {
+                type_: ast::Type::Scalar(red_int_type),
+                element: red_int_type,
+                count: 1,
+                semantics: red_sem.map(Into::into).unwrap_or(AtomSemantics::Relaxed),
+                scope: red_scope.unwrap_or(MemScope::Gpu)
+            },
+            arguments: RedVectorArgs { src_address: a, src_values: b }
+        }
+    }
+    .red_int_type: ScalarType = { .u32, .s32, .u64 };
     .red_sem: AtomSemantics = { .relaxed, .acquire, .release, .acq_rel };
     .red_scope: MemScope =    { .cta, .cluster, .gpu, .sys };
     .red_vec: VectorPrefix =  { .v2, .v4, .v8 };
@@ -4650,7 +4672,9 @@ derive_parser!(
             arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
         }
     }
-    sust.b.2d{.vec}.stype{.sustclamp}  [a, b], c => {
+    // .cs is the cache-streaming hint: no effect on the result, so it is read and dropped.
+    sust.b.2d{.cs}{.vec}.stype{.sustclamp}  [a, b], c => {
+        let _ = cs;
         Instruction::Sust {
             data: SustData {
                 type_: TexType::Texref,
@@ -4661,6 +4685,27 @@ derive_parser!(
                 clamp: sustclamp.unwrap_or(SustClamp::Trap)
             },
             arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+
+    .vec: VectorPrefix = { .v2, .v4 };
+    .stype: ScalarType = { .b8, .b16, .b32 };
+    .sustclamp: SustClamp = { .trap, .clamp, .zero };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-suld
+    // Raw bits, x in bytes, like sust.b. Out-of-range reads come back as zero
+    // from AMD image loads, which is what .zero asks for.
+    suld.b.2d{.vec}.stype{.sustclamp}  d, [a, b] => {
+        Instruction::Suld {
+            data: SustData {
+                type_: TexType::Texref,
+                dims: TexDimensions::D2,
+                formatted: false,
+                vector: vec.map(|v| v.len()),
+                scalar_type: stype,
+                clamp: sustclamp.unwrap_or(SustClamp::Trap)
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
         }
     }
 

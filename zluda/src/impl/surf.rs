@@ -53,6 +53,9 @@ unsafe fn read_object_page(object: usize, into: &mut [u8]) -> bool {
 
 // Put `texture`'s sampler onto every surface object over the same array.
 pub(crate) unsafe fn adopt_sampler(array: usize, texture: usize) {
+    if std::env::var_os("ZLUDA_NO_ADOPT").is_some() {
+        return;
+    }
     if array == 0 || texture == 0 {
         return;
     }
@@ -89,15 +92,69 @@ pub(crate) unsafe fn adopt_sampler(array: usize, texture: usize) {
         // with whatever HIP keeps at that offset, which reads as a network that
         // works some of the time and not others. If a future ROCm moves the
         // sampler, this line is the only warning there will be.
-        if onto[..SAMPLER_OFFSET] != from[..SAMPLER_OFFSET] {
+        //
+        // Except for what only concerns the mip chain. A surface over a level of a
+        // mipmapped array says "all the levels" (LAST_LEVEL and the fields around it,
+        // and the last words of the page) where a texture over the same level says
+        // "this one". The image is the same and the sampler does not depend on it.
+        // Taking that difference for a different layout left the surface of every
+        // image DLSS creates over a mipmapped array (the shared textures of a
+        // Direct3D host) without a sampler: the network then read one texel of its
+        // input everywhere. So what is compared is what identifies the image: its
+        // base address, its size and its kind.
+        let same_image = |a: &[u8], b: &[u8]| -> bool {
+            // per dword of the descriptor: the bits that have to be the same
+            const IDENTITY: [u32; 8] = [
+                !0,         // base address
+                0x0000_00FF, // base address, high bits
+                !0,         // width and height
+                0xF000_0000, // the kind of image (the rest is channel selection, mip range, tiling)
+                !0,
+                !0,
+                !0,
+                !0,
+            ];
+            IDENTITY.iter().enumerate().all(|(index, mask)| {
+                let at = |bytes: &[u8]| {
+                    u32::from_le_bytes([
+                        bytes[index * 4],
+                        bytes[index * 4 + 1],
+                        bytes[index * 4 + 2],
+                        bytes[index * 4 + 3],
+                    ])
+                };
+                at(a) & mask == at(b) & mask
+            })
+        };
+        if !same_image(&onto[..SAMPLER_OFFSET], &from[..SAMPLER_OFFSET]) {
             static COMPLAINED: std::sync::Once = std::sync::Once::new();
             COMPLAINED.call_once(|| {
+                let words = |bytes: &[u8]| -> String {
+                    bytes
+                        .chunks(4)
+                        .map(|w| format!("{:08X}", u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                eprintln!("[zluda] texture page: {} | surface page: {}", words(&from), words(&onto));
                 eprintln!(
                     "[zluda] a texture object and a surface object over the same array do not agree on their image descriptor, so the surface cannot be given a sampler. The offset this assumes for it (byte {}) is probably no longer right for this version of ROCm. A tex through a surface object will sample with whatever happens to sit there. See the note in zluda/src/impl/surf.rs.",
                     SAMPLER_OFFSET
                 );
             });
             continue;
+        }
+        if std::env::var_os("ZLUDA_DEBUG_TEX").is_some() {
+            eprintln!(
+                "[zluda tex] surface {:#x} over array {:#x} takes the sampler of texture {:#x}: {:08X} {:08X} {:08X} {:08X}",
+                object,
+                array,
+                texture,
+                u32::from_le_bytes(from[SAMPLER_OFFSET..SAMPLER_OFFSET + 4].try_into().unwrap()),
+                u32::from_le_bytes(from[SAMPLER_OFFSET + 4..SAMPLER_OFFSET + 8].try_into().unwrap()),
+                u32::from_le_bytes(from[SAMPLER_OFFSET + 8..SAMPLER_OFFSET + 12].try_into().unwrap()),
+                u32::from_le_bytes(from[SAMPLER_OFFSET + 12..SAMPLER_OFFSET + 16].try_into().unwrap()),
+            );
         }
         let _ = hipMemcpyHtoD(
             hipDeviceptr_t((object + SAMPLER_OFFSET) as *mut _),
@@ -154,7 +211,32 @@ pub(crate) unsafe fn object_create(
         list.get_or_insert_with(Vec::new)
             .push((handle, *p_surf_object as usize));
     }
+    if std::env::var_os("ZLUDA_DEBUG_TEX").is_some() {
+        eprintln!("[zluda tex] surface {:#x} created over array {:#x}", *p_surf_object as usize, handle);
+    }
     give_plain_sampler(driver_desc, handle);
+    // A texture object over the array that was made before this surface has already come and gone
+    // through adopt_sampler, which only reaches the surfaces that existed then: this one would keep
+    // the plain sampler above, where one that came first gets the program's. Which of the two a program
+    // makes first differs from image to image of the same network, and with it the picture (half the
+    // brightness where the history is read through a surface whose sampler is the plain one).
+    if std::env::var_os("ZLUDA_DEBUG_TEX").is_some() {
+        let mut page = [0u8; 64];
+        if read_object_page(*p_surf_object as usize, &mut page) {
+            let words: Vec<String> = page
+                .chunks(4)
+                .map(|w| format!("{:08X}", u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+                .collect();
+            eprintln!("[zluda tex] surface page: {}", words.join(" "));
+        }
+    }
+    let known = super::tex::last_texture_over(handle);
+    if std::env::var_os("ZLUDA_DEBUG_TEX").is_some() {
+        eprintln!("[zluda tex] surface {:#x} over array {:#x}: texture made before it: {:?}", *p_surf_object as usize, handle, known);
+    }
+    if let Some(texture) = known {
+        adopt_sampler(handle, texture);
+    }
     Ok(())
 }
 

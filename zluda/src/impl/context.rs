@@ -165,7 +165,9 @@ pub(crate) fn set_cache_config(config: CUfunc_cache) -> CUresult {
 }
 
 pub(crate) fn synchronize() -> hipError_t {
-    unsafe { hipDeviceSynchronize() }
+    let result = unsafe { hipDeviceSynchronize() };
+    unsafe { super::array::debug_report() };
+    result
 }
 
 pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {

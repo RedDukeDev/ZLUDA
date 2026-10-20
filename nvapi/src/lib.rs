@@ -762,6 +762,58 @@ unsafe extern "C" fn NvAPI_GPU_GetLogicalGpuInfo(
     0
 }
 
+
+// The file name (lower case) of the module that called into this one: the first frame of the stack that is
+// not in this DLL. None when it cannot be told.
+#[cfg(windows)]
+fn caller_module_name() -> Option<String> {
+    use std::ffi::c_void;
+    extern "system" {
+        fn RtlCaptureStackBackTrace(
+            frames_to_skip: u32,
+            frames_to_capture: u32,
+            back_trace: *mut *mut c_void,
+            back_trace_hash: *mut u32,
+        ) -> u16;
+        fn GetModuleHandleExW(flags: u32, address: *const c_void, module: *mut *mut c_void) -> i32;
+        fn GetModuleFileNameW(module: *mut c_void, name: *mut u16, size: u32) -> u32;
+    }
+    const FROM_ADDRESS: u32 = 0x4;
+    const UNCHANGED_REFCOUNT: u32 = 0x2;
+    unsafe {
+        let mut mine: *mut c_void = std::ptr::null_mut();
+        GetModuleHandleExW(
+            FROM_ADDRESS | UNCHANGED_REFCOUNT,
+            caller_module_name as *const c_void,
+            &mut mine,
+        );
+        let mut frames = [std::ptr::null_mut::<c_void>(); 16];
+        let count = RtlCaptureStackBackTrace(0, 16, frames.as_mut_ptr(), std::ptr::null_mut());
+        for &frame in &frames[..count as usize] {
+            let mut module: *mut c_void = std::ptr::null_mut();
+            if GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, frame, &mut module) == 0
+                || module.is_null()
+                || module == mine
+            {
+                continue;
+            }
+            let mut name = [0u16; 520];
+            let length = GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) as usize;
+            if length == 0 {
+                return None;
+            }
+            let path = String::from_utf16_lossy(&name[..length]).to_lowercase();
+            return Some(path.rsplit(['\\', '/']).next().unwrap_or("").to_string());
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn caller_module_name() -> Option<String> {
+    None
+}
+
 #[allow(non_snake_case)]
 unsafe extern "C" fn NvAPI_GPU_GetArchInfo(
     _physical_gpu: NvPhysicalGpuHandle,
@@ -779,18 +831,30 @@ unsafe extern "C" fn NvAPI_GPU_GetArchInfo(
     // Neural rendering refuses to create its feature below GB200 (432):
     // nvngx_dlssnr.dll+0x17E94 reads the architecture, and every value from 320
     // to 416 lands on a rejection with 0xBAD00001, logging 432 as what it
-    // wanted. Claiming 432 is the only way to get past that, so the value is
-    // settable -- ZLUDA_NVAPI_GPU_ARCH, decimal or 0x-prefixed hex.
-    arch_info.architecture = std::env::var("ZLUDA_NVAPI_GPU_ARCH")
-        .ok()
-        .and_then(|value| {
+    // wanted. A process can run that network beside the upscalers, which are
+    // content with Ada, so the answer follows the caller: the module that asked
+    // is named, and a name carrying "dlssnr" is told Blackwell.
+    //
+    // ZLUDA_NVAPI_GPU_ARCH, decimal or 0x-prefixed hex, overrides all of it, for
+    // everyone. ZLUDA_NVAPI_GPU_ARCH_NEURAL overrides the neural rendering
+    // answer alone.
+    let parse = |name: &str| {
+        std::env::var(name).ok().and_then(|value| {
             let value = value.trim().to_string();
             match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
                 Some(hex) => u32::from_str_radix(hex, 16).ok(),
                 None => value.parse::<u32>().ok(),
             }
         })
-        .unwrap_or(_NV_GPU_ARCHITECTURE_ID_NV_GPU_ARCHITECTURE_AD100 as NvU32);
+    };
+    let ada = _NV_GPU_ARCHITECTURE_ID_NV_GPU_ARCHITECTURE_AD100 as NvU32;
+    arch_info.architecture = parse("ZLUDA_NVAPI_GPU_ARCH").unwrap_or_else(|| {
+        if caller_module_name().map_or(false, |name| name.contains("dlssnr")) {
+            parse("ZLUDA_NVAPI_GPU_ARCH_NEURAL").unwrap_or(0x1B0)
+        } else {
+            ada
+        }
+    });
     // version is left exactly as the caller set it.
     arch_info.implementation = 0;
     arch_info.revision = 0;

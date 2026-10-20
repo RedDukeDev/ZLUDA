@@ -86,6 +86,11 @@ impl ModuleCache {
             .filter(modules::backend_key.eq(&key.backend_key))
             .returning(modules::binary)
             .get_result(&mut self.0)
+            .map_err(|e| {
+                if std::env::var_os("ZLUDA_DEBUG_COMPILE").is_some() {
+                    eprintln!("[zluda] cache query failed: {e}");
+                }
+            })
             .ok()
     }
 

@@ -231,3 +231,16 @@ cuda_macros::cuda_function_declarations!(
 
 #[cfg(test)]
 mod tests;
+
+// For the host that drives ZLUDA from several threads (see zluda_common::set_thread_high_priority).
+#[no_mangle]
+pub extern "C" fn zluda_set_thread_high_priority(high: i32) {
+    zluda_common::set_thread_high_priority(high != 0);
+}
+
+/// The stream a null CUDA stream stands for on the calling thread, for code that launches kernels on the
+/// HIP side itself and must go where ZLUDA's own launches go.
+#[no_mangle]
+pub extern "C" fn zluda_thread_default_stream() -> *mut std::ffi::c_void {
+    zluda_common::thread_default_stream().0.cast()
+}

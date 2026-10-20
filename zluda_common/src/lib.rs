@@ -179,6 +179,91 @@ macro_rules! from_cuda_transmute {
     };
 }
 
+// CUstream is HIP's stream, with one exception. CUDA's default stream (null) is shared by every thread
+// of the process, and so is HIP's: two networks driven from two threads, as the neural rendering and an
+// upscaler are, queue behind one another on it, and a frame that wanted a few milliseconds waits for
+// whatever the other thread has in flight. ZLUDA_PER_THREAD_STREAM=1 gives each thread a default stream
+// of its own (what nvcc's --default-stream per-thread builds do), so they do not meet. It is only safe
+// where one thread drives one network from start to end, which the runtime arranges.
+fn per_thread_default_stream() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZLUDA_PER_THREAD_STREAM").map_or(false, |value| value.trim() == "1"))
+}
+
+thread_local! {
+    // Whether this thread's default stream is one of high priority, and the stream made for it.
+    static HIGH_PRIORITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRIORITY_STREAM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A thread that asks for it has a default stream of high priority instead of the plain per-thread one: a
+/// latency-sensitive caller (an upscaler frame) then gets compute units ahead of a long-running one
+/// (the neural rendering) on the same GPU. Only meaningful with ZLUDA_PER_THREAD_STREAM=1.
+pub fn set_thread_high_priority(high: bool) {
+    HIGH_PRIORITY.with(|flag| flag.set(high));
+}
+
+/// The stream a null stream stands for on this thread.
+pub fn thread_default_stream() -> hipStream_t {
+    if HIGH_PRIORITY.with(|flag| flag.get()) {
+        let existing = PRIORITY_STREAM.with(|cell| cell.get());
+        if existing != 0 {
+            return hipStream_t(existing as *mut _);
+        }
+        unsafe {
+            let (mut least, mut greatest) = (0i32, 0i32);
+            let mut stream = hipStream_t(std::ptr::null_mut());
+            // non-blocking (flag 1): not ordered against the legacy default stream either
+            if hipDeviceGetStreamPriorityRange(&mut least, &mut greatest).is_ok()
+                && hipStreamCreateWithPriority(&mut stream, 1, greatest).is_ok()
+            {
+                PRIORITY_STREAM.with(|cell| cell.set(stream.0 as usize));
+                return stream;
+            }
+        }
+    }
+    // hipStreamPerThread
+    hipStream_t(2usize as *mut _)
+}
+
+#[cfg(target_pointer_width = "64")]
+impl<'a, E: CudaErrorType> FromCuda<'a, CUstream, E> for hipStream_t {
+    fn from_cuda(x: &'a CUstream) -> Result<Self, E> {
+        let stream: hipStream_t = unsafe { std::mem::transmute(*x) };
+        if stream.0.is_null() && per_thread_default_stream() {
+            return Ok(thread_default_stream());
+        }
+        Ok(stream)
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *mut CUstream, E> for &'a mut hipStream_t {
+    fn from_cuda(x: &'a *mut CUstream) -> Result<Self, E> {
+        match unsafe { x.cast::<hipStream_t>().as_mut() } {
+            Some(x) => Ok(x),
+            None => Err(E::INVALID_VALUE),
+        }
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *const CUstream, E> for *const hipStream_t {
+    fn from_cuda(x: &'a *const CUstream) -> Result<Self, E> {
+        Ok(x.cast::<hipStream_t>())
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *mut CUstream, E> for *mut hipStream_t {
+    fn from_cuda(x: &'a *mut CUstream) -> Result<Self, E> {
+        Ok(x.cast::<hipStream_t>())
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *mut *const CUstream, E> for *mut *const hipStream_t {
+    fn from_cuda(x: &'a *mut *const CUstream) -> Result<Self, E> {
+        Ok(x.cast::<*const hipStream_t>())
+    }
+}
+
 /// Implement the [`FromCuda`] trait for a [`ZludaObject`].
 #[macro_export]
 macro_rules! from_cuda_object {
@@ -279,7 +364,6 @@ from_cuda_nop!(
 );
 from_cuda_transmute!(
     CUuuid => hipUUID,
-    CUstream => hipStream_t,
     CUpointer_attribute => hipPointer_attribute,
     CUdeviceptr_v2 => hipDeviceptr_t,
     CUevent => hipEvent_t,

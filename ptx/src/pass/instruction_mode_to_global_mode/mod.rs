@@ -2194,6 +2194,7 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Sad { .. }
         | ast::Instruction::Tex { .. }
         | ast::Instruction::Sust { .. }
+        | ast::Instruction::Suld { .. }
         | ast::Instruction::MovMatrix { .. }
         | ast::Instruction::WmmaMma { .. }
         | ast::Instruction::Copysign { .. } => InstructionModes::none(),

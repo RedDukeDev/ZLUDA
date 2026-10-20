@@ -289,6 +289,14 @@ pub(crate) unsafe fn alloc_pitch_v2(
 }
 
 pub(crate) unsafe fn copy_2d_v2(memcpy: hip_Memcpy2D) -> CUresult {
+    if std::env::var_os("ZLUDA_DEBUG_ARRAYS").is_some() {
+        eprintln!(
+            "[zluda copy2d] src type {:?} dev {:?} array {:?} pitch {} x {} y {} -> dst type {:?} dev {:?} array {:?} pitch {} x {} y {}: {} bytes x {} rows",
+            memcpy.srcMemoryType, memcpy.srcDevice.0, memcpy.srcArray, memcpy.srcPitch, memcpy.srcXInBytes, memcpy.srcY,
+            memcpy.dstMemoryType, memcpy.dstDevice.0, memcpy.dstArray, memcpy.dstPitch, memcpy.dstXInBytes, memcpy.dstY,
+            memcpy.WidthInBytes, memcpy.Height
+        );
+    }
     hipMemcpyParam2D(&memcpy)?;
     Ok(())
 }

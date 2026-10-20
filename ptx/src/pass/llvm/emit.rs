@@ -529,7 +529,7 @@ fn get_input_argument_type(
     state_space: ast::StateSpace,
 ) -> Result<LLVMTypeRef, TranslateError> {
     match state_space {
-        ast::StateSpace::ParamEntry | ast::StateSpace::Shared => {
+        ast::StateSpace::ParamEntry | ast::StateSpace::Shared | ast::StateSpace::SharedCta => {
             Ok(unsafe { LLVMPointerTypeInContext(context, get_state_space(state_space)?) })
         }
         ast::StateSpace::Reg => get_type(context, v_type),
@@ -795,6 +795,7 @@ impl<'a> MethodEmitContext<'a> {
             | ast::Instruction::Tanh { .. }
             | ast::Instruction::Tex { .. }
             | ast::Instruction::Sust { .. }
+            | ast::Instruction::Suld { .. }
             | ast::Instruction::MovMatrix { .. }
             | ast::Instruction::WmmaMma { .. } => return Err(error_unreachable()),
         }
@@ -1436,6 +1437,23 @@ impl<'a> MethodEmitContext<'a> {
     ) -> Result<(), TranslateError> {
         let address = self.resolver.value(arguments.src_address)?;
         let values = self.resolver.value(arguments.src_values)?;
+        // A scalar integer reduction is one plain atomic add.
+        if matches!(
+            data.element,
+            ast::ScalarType::U32 | ast::ScalarType::S32 | ast::ScalarType::U64
+        ) {
+            unsafe {
+                LLVMZludaBuildAtomicRMW(
+                    self.builder,
+                    LLVMZludaAtomicRMWBinOp::LLVMZludaAtomicRMWBinOpAdd,
+                    address,
+                    values,
+                    get_scope(data.scope)?,
+                    get_ordering(data.semantics),
+                )
+            };
+            return Ok(());
+        }
         let element = get_scalar_type(self.context, data.element);
         let word_bytes = data.element.size_of() as u64;
         let i32_type = unsafe { LLVMInt32TypeInContext(self.context) };

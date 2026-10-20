@@ -267,6 +267,9 @@ fn get_best_ptx_and_compile(
     let attributes = ExtraCacheAttributes {
         clock_rate: hip_properties.clockRate as u32,
         is_debug: cfg!(debug_assertions),
+        param_provenance: llvm_zluda::compile::param_provenance_enabled(),
+        inline_image: llvm_zluda::compile::inline_image_enabled(),
+        ptx_impl_revision: ptx_impl_revision_of(text.as_ref().map(|text| text.as_ref())),
     };
     let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
         (Some(text), Some(p)) => (|| {
@@ -280,6 +283,20 @@ fn get_best_ptx_and_compile(
     // held to it: an object with none of them is not an answer.
     let kernels_wanted = count_kernels_declared(&module);
     let mut cached_binary = load_cached_binary(&mut cache_with_key, kernels_wanted);
+    if debug_compile() {
+        if let Some((_, key)) = cache_with_key.as_ref() {
+            eprintln!(
+                "[zluda] cache key {} ({} {} {}) device {} kernels {} -> {}",
+                key.hash,
+                key.compiler_version,
+                key.zluda_version,
+                key.backend_key,
+                key.device,
+                kernels_wanted,
+                if cached_binary.is_some() { "hit" } else { "miss" }
+            );
+        }
+    }
     // The exact device missed. Before paying for a translation, try the
     // family-generic name: a module built for e.g. gfx11-generic loads on
     // every card in that family regardless of which one is actually present
@@ -332,9 +349,34 @@ pub(crate) fn load_hip_module(
     get_best_ptx_and_compile(global_state, library)
 }
 
+// Bumped whenever the translation changes in a way the git revision does not show, so a cache
+// built before the change is not answered from afterwards. History:
+//   1  null texture objects read as zero, image helpers inlined, parameter provenance recovered
+//   2  a `tex` with integer coordinates is a texel fetch (unnormalised, unfiltered) even through a
+//      normalised texture object
+//   3  a raw surface store (`sust.b`) into a surface of narrow channels, half floats above all,
+//      decodes the bits into the value the image store encodes back to them; before, it stored zeros
+//
+// The revision a module is filed under is the newest one that changes how *it* translates, so a
+// change that touches one kind of module leaves the cached translations of every other kind valid.
+const PTX_IMPL_REVISION: u32 = 2;
+const PTX_IMPL_REVISION_RAW_SURFACE_STORE: u32 = 3;
+
+fn ptx_impl_revision_of(text: Option<&str>) -> u32 {
+    match text {
+        Some(text) if text.contains("sust.b.") => PTX_IMPL_REVISION_RAW_SURFACE_STORE,
+        _ => PTX_IMPL_REVISION,
+    }
+}
+
 #[derive(serde::Serialize)]
 struct ExtraCacheAttributes {
     is_debug: bool,
+    // What was switched on when the module was translated: toggling one must not reuse modules
+    // built under the other setting.
+    param_provenance: bool,
+    inline_image: bool,
+    ptx_impl_revision: u32,
     // Left out of the cache key. The clock rate only scales nanosleep, so a
     // module built on one card runs correctly on another; keyed by it, a cache
     // shipped already full would only ever be found on cards that report the
@@ -428,7 +470,11 @@ fn load_cached_binary(
 ) -> Option<(Vec<u8>, u32, Option<Metadata32Bit>)> {
     let binary = cache_with_key
         .as_mut()
-        .and_then(|(c, key)| c.get_module_binary(key))?;
+        .and_then(|(c, key)| c.get_module_binary(key));
+    if debug_compile() && binary.is_none() {
+        eprintln!("[zluda] cache query returned nothing");
+    }
+    let binary = binary?;
     // An entry with none of the kernels the PTX declares cannot be right, and
     // one such entry is in the everyday cache to this day: the same PTX that
     // gives a 14 MB object under one build gave a 2312-byte one under another,
@@ -446,6 +492,9 @@ fn load_cached_binary(
             cache.remove_module(key);
         }
         return None;
+    }
+    if debug_compile() {
+        eprintln!("[zluda] cached object: {} bytes, {} kernels", binary.len(), kernel_metadata::count_kernels(&binary).unwrap_or(0));
     }
     let sm_version = kernel_metadata::ModuleMetadataV1::read_object(&binary)?
         .sm_version
