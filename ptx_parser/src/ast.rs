@@ -1068,14 +1068,14 @@ ptx_parser_macros::generate_instruction_type!(
                 src_ptr: {
                     repr: T,
                     type: {
-                        if data.type_ == TexType::Texref {
-                            Type::Texref
+                        if data.type_ == TexType::Ref {
+                            Type::Surfref
                         } else {
                             Type::Scalar(ScalarType::U64)
                         }
                     },
                     space: {
-                        if data.type_ == TexType::Texref {
+                        if data.type_ == TexType::Ref {
                             StateSpace::Global
                         } else {
                             StateSpace::Reg
@@ -1107,14 +1107,14 @@ ptx_parser_macros::generate_instruction_type!(
                 src_ptr: {
                     repr: T,
                     type: {
-                        if data.type_ == TexType::Texref {
-                            Type::Texref
+                        if data.type_ == TexType::Ref {
+                            Type::Surfref
                         } else {
                             Type::Scalar(ScalarType::U64)
                         }
                     },
                     space: {
-                        if data.type_ == TexType::Texref {
+                        if data.type_ == TexType::Ref {
                             StateSpace::Global
                         } else {
                             StateSpace::Reg
@@ -1141,14 +1141,14 @@ ptx_parser_macros::generate_instruction_type!(
                 src_ptr:  {
                     repr: T,
                     type: {
-                        if data.type_ == TexType::Texref {
+                        if data.type_ == TexType::Ref {
                             Type::Texref
                         } else {
                             Type::Scalar(ScalarType::U64)
                         }
                     },
                     space: {
-                        if data.type_ == TexType::Texref {
+                        if data.type_ == TexType::Ref {
                             StateSpace::Global
                         } else {
                             StateSpace::Reg
@@ -1480,6 +1480,9 @@ impl<ID: std::fmt::Display> std::fmt::Display for Variable<ID> {
             Type::Texref => {
                 return write!(f, " .texref");
             }
+            Type::Surfref => {
+                return write!(f, " .surfref");
+            }
         };
 
         if let Some(size) = vector_size {
@@ -1514,6 +1517,7 @@ pub enum Type {
     // .param.b32 foo[4];
     Array(Option<NonZeroU8>, ScalarType, Vec<u32>),
     Texref,
+    Surfref,
 }
 
 impl std::fmt::Display for Type {
@@ -1575,6 +1579,7 @@ impl Type {
                 }
             }
             Type::Texref => return None,
+            Type::Surfref => return None,
         })
     }
 }
@@ -1786,7 +1791,7 @@ pub enum RegOrImmediate<Ident> {
 #[derive(Clone)]
 pub enum ParsedOperand<Ident> {
     Reg(Ident),
-    RegOffset(Ident, i32),
+    RegOffset(Ident, i64),
     Imm(ImmediateValue),
     VecMember(Ident, u8),
     // None denotes a sink; retain its position in the vector.
@@ -3207,8 +3212,8 @@ impl TexData {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum TexType {
-    Texref,
-    Texobj,
+    Ref,
+    Obj,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

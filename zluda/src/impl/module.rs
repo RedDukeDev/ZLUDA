@@ -1,6 +1,6 @@
 use super::driver;
-use crate::r#impl::function;
 use crate::r#impl::{driver::GlobalState, function::Function};
+use crate::r#impl::{function, surf};
 use cuda_types::{cuda::*, dark_api::FatbinFileHeader};
 use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
@@ -33,6 +33,7 @@ pub(crate) struct Module {
 
 struct ModuleMutable {
     functions: FxHashMap<CString, Box<Function>>,
+    surfrefs: FxHashMap<CString, Box<surf::SurfRefData>>,
 }
 
 impl ModuleMutable {
@@ -50,6 +51,7 @@ impl ModuleMutable {
                 unsafe { hipModuleGetFunction(&mut func_handle, module, entry.key().as_ptr()) }?;
                 let func = Box::new(Function {
                     base: func_handle,
+                    name: entry.key().clone(),
                     sm_version,
                     explicit_args_size_align,
                 });
@@ -153,6 +155,7 @@ impl Module {
             sm_version,
             mutable: Mutex::new(ModuleMutable {
                 functions: FxHashMap::default(),
+                surfrefs: FxHashMap::default(),
             }),
             bit32,
         }
@@ -356,15 +359,20 @@ pub(crate) fn load_hip_module(
 //      normalised texture object
 //   3  a raw surface store (`sust.b`) into a surface of narrow channels, half floats above all,
 //      decodes the bits into the value the image store encodes back to them; before, it stored zeros
+//   4  raw surface accesses (`sust.b`, `suld.b`) go through the packed image instructions, as upstream
+//      does: any dimension, the pixel size carried in the surface handle, a transfer wider than a pixel
+//      made of several
 //
 // The revision a module is filed under is the newest one that changes how *it* translates, so a
 // change that touches one kind of module leaves the cached translations of every other kind valid.
 const PTX_IMPL_REVISION: u32 = 2;
-const PTX_IMPL_REVISION_RAW_SURFACE_STORE: u32 = 3;
+const PTX_IMPL_REVISION_RAW_SURFACE: u32 = 4;
 
 fn ptx_impl_revision_of(text: Option<&str>) -> u32 {
     match text {
-        Some(text) if text.contains("sust.b.") => PTX_IMPL_REVISION_RAW_SURFACE_STORE,
+        Some(text) if text.contains("sust.b.") || text.contains("suld.b.") => {
+            PTX_IMPL_REVISION_RAW_SURFACE
+        }
         _ => PTX_IMPL_REVISION,
     }
 }
@@ -659,9 +667,31 @@ pub(crate) unsafe fn get_tex_ref(
 }
 
 pub(crate) unsafe fn get_surf_ref(
-    surfref: *mut *mut textureReference,
+    surfref: &mut &surf::SurfRefData,
     hmod: &Module,
     name: *const ::core::ffi::c_char,
 ) -> hipError_t {
-    hipModuleGetTexRef(surfref, hmod.base, name)
+    if name.is_null() {
+        return Err(hipErrorCode_t::InvalidValue);
+    }
+    let name = CStr::from_ptr(name).to_owned();
+    let result: *const surf::SurfRefData = {
+        let mut module_mutable = hmod.mutable.lock().map_err(|_| hipErrorCode_t::Unknown)?;
+        match module_mutable.surfrefs.entry(name) {
+            hash_map::Entry::Occupied(entry) => std::ptr::from_ref(entry.get().as_ref()),
+            hash_map::Entry::Vacant(entry) => {
+                let mut texref = std::ptr::null_mut();
+                hipModuleGetTexRef(&mut texref, hmod.base, entry.key().as_ptr())?;
+                let mut devptr = mem::zeroed();
+                let mut bytes = mem::zeroed();
+                hipModuleGetGlobal(&mut devptr, &mut bytes, hmod.base, entry.key().as_ptr())?;
+                std::ptr::from_ref(entry.insert(Box::new(surf::SurfRefData {
+                    base: texref,
+                    devptr,
+                })))
+            }
+        }
+    };
+    *surfref = &*result;
+    Ok(())
 }

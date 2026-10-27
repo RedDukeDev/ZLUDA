@@ -377,8 +377,8 @@ fn run_instruction<'input>(
             let name = format!(
                 "{prefix}_{mode}_{dims}_{vector}{scalar}",
                 prefix = match type_ {
-                    ast::TexType::Texref => "sustref",
-                    ast::TexType::Texobj => "sustobj",
+                    ast::TexType::Ref => "sustref",
+                    ast::TexType::Obj => "sustobj",
                 },
                 mode = if formatted { "p" } else { "b" },
                 dims = match dims {
@@ -388,7 +388,8 @@ fn run_instruction<'input>(
                 },
                 vector = match vector {
                     Some(n) => format!("v{}_", n.get()),
-                    None => String::new(),
+                    None if formatted => String::new(),
+                    None => "v1_".to_string(),
                 },
                 scalar = scalar_to_ptx_name(scalar_type),
             );
@@ -409,8 +410,8 @@ fn run_instruction<'input>(
             let name = format!(
                 "{prefix}_b_{dims}_{vector}{scalar}",
                 prefix = match type_ {
-                    ast::TexType::Texref => "suldref",
-                    ast::TexType::Texobj => "suldobj",
+                    ast::TexType::Ref => "suldref",
+                    ast::TexType::Obj => "suldobj",
                 },
                 dims = match dims {
                     ast::TexDimensions::D1 => "1d",
@@ -419,7 +420,7 @@ fn run_instruction<'input>(
                 },
                 vector = match vector {
                     Some(n) => format!("v{}_", n.get()),
-                    None => String::new(),
+                    None => "v1_".to_string(),
                 },
                 scalar = scalar_to_ptx_name(scalar_type),
             );
@@ -443,8 +444,8 @@ fn run_instruction<'input>(
                 t => t,
             };
             let prefix = match type_ {
-                ast::TexType::Texref => "texref",
-                ast::TexType::Texobj => "texobj",
+                ast::TexType::Ref => "texref",
+                ast::TexType::Obj => "texobj",
             };
             let suffix = match (level, gather) {
                 (_, Some(component)) => ["_gather_r", "_gather_g", "_gather_b", "_gather_a"]

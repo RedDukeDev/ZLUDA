@@ -843,6 +843,16 @@ extern "C"
         return ballot(value, true) != 0;
     }
 
+    bool FUNC(vote_any_pred)(bool value)
+    {
+        return FUNC_CALL(vote_sync_any_pred)(value, UINT32_MAX);
+    }
+
+    bool FUNC(vote_any_pred_negate)(bool value)
+    {
+        return FUNC_CALL(vote_sync_any_pred_negate)(value, UINT32_MAX);
+    }
+
     // IMPORTANT: exec mask must be a subset of membermask, the behavior is undefined otherwise
     bool FUNC(vote_sync_all_pred)(bool value, uint32_t membermask __attribute__((unused)))
     {
@@ -853,6 +863,16 @@ extern "C"
     bool FUNC(vote_sync_all_pred_negate)(bool value, uint32_t membermask __attribute__((unused)))
     {
         return ballot(value, false) == 0;
+    }
+
+    bool FUNC(vote_all_pred)(bool value)
+    {
+        return FUNC_CALL(vote_sync_all_pred)(value, UINT32_MAX);
+    }
+
+    bool FUNC(vote_all_pred_negate)(bool value)
+    {
+        return FUNC_CALL(vote_sync_all_pred_negate)(value, UINT32_MAX);
     }
 
     uint32_t FUNC(vote_sync_ballot_b32)(bool value, uint32_t membermask __attribute__((unused)))
@@ -1286,7 +1306,7 @@ extern "C"
 
     // We wrap the intrinsic in an optnone function to prevent ZLUDA-specific
     // passes from optimizing away the intrinsic call
-    static __device__ float4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32_optnone [[clang::optnone]] (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
+    static __device__ float4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32_optnone [[clang::optnone]](uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, float4::Native_vec_ c_reg)
     {
         __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg) __asm("llvm.zluda.mma.m16n8k16.f32.bf16.bf16.f32");
         return std::bit_cast<float4::Native_vec_>(__llvm_zluda_mma_m16n8k16_f32_bf16_bf16_f32(a_reg, b_reg, std::bit_cast<uint4::Native_vec_>(c_reg)));
@@ -1306,7 +1326,7 @@ extern "C"
 
     // We wrap the intrinsic in an optnone function to prevent ZLUDA-specific
     // passes from optimizing away the intrinsic call
-    static __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32_optnone [[clang::optnone]] (uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg)
+    static __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32_optnone [[clang::optnone]](uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg)
     {
         __device__ uint4::Native_vec_ __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32(uint4::Native_vec_ a_reg, uint2::Native_vec_ b_reg, uint4::Native_vec_ c_reg) __asm("llvm.zluda.mma.m16n8k32.s32.s8.s8.s32");
         return __llvm_zluda_mma_m16n8k32_s32_s8_s8_fs32(a_reg, b_reg, c_reg);
@@ -1534,10 +1554,20 @@ extern "C"
     // the GPU read address 0 and fault -- which also takes the whole queue down with it. Redirect 0
     // to an all-zero descriptor, which the hardware treats as a null resource (reads return 0).
     // Idea and approach from the d4r project (patches/zluda/0005).
+    // The handle of a surface object carries the size of its pixel in the three low bits (see
+    // surf.rs); the descriptor is at the address with those bits cleared. A texture object's
+    // address has them clear already, so this is also what a `tex` through a surface needs.
+    const uint32_t RESERVED_SURFACE_BOTTOM_BITS = 3;
+
+    static uint64_t adjust_surfobj(uint64_t surfobj) __device__
+    {
+        return surfobj & ~((uint64_t(1) << RESERVED_SURFACE_BOTTOM_BITS) - 1);
+    }
+
     __device__ static unsigned int zluda_null_texture[32];
     static uint64_t texture_or_null(uint64_t texobj) __device__
     {
-        return texobj != 0 ? texobj : uint64_t(uintptr_t(zluda_null_texture));
+        return texobj != 0 ? adjust_surfobj(texobj) : uint64_t(uintptr_t(zluda_null_texture));
     }
 
     static std::pair<GLOBAL_SPACE void *, GLOBAL_SPACE void *> get_image_and_sampler(uint64_t texobj) __device__
@@ -1681,7 +1711,7 @@ extern "C"
         // word - exactly the kind of silent data loss worth avoiding.
         // A surface object is the image descriptor itself, with no sampler after it.
         __device__ void __ockl_image_store_2D(const unsigned int CONSTANT_SPACE *, v2s32, v4f32);
-        __ockl_image_store_2D((const unsigned int CONSTANT_SPACE *)surfobj, coord, data);
+        __ockl_image_store_2D((const unsigned int CONSTANT_SPACE *)adjust_surfobj(surfobj), coord, data);
     }
 
     void FUNC(sustobj_p_2d_v4_b32)(uint64_t surfobj, v2s32 coord, v4s32 data)
@@ -1689,376 +1719,11 @@ extern "C"
         store_2D(surfobj, coord, std::bit_cast<v4f32>(data));
     }
 
-    // sust.b writes raw bits and takes the x coordinate in bytes, so it has to be
-    // scaled down to a sample index first. This mirrors what HIP's surf2Dwrite does:
-    // divide by the bytes per channel, then by the channels per pixel, both read
-    // from the image descriptor at runtime.
-    static int32_t byte_x_to_sample_x(uint64_t surfobj, int32_t x) __device__
-    {
-        __device__ int __ockl_image_channel_data_type_2D(const unsigned int CONSTANT_SPACE *);
-        __device__ int __ockl_image_channel_order_2D(const unsigned int CONSTANT_SPACE *);
-        // Indexed by hsa_ext_image_channel_type_t; 3 means "divide by 3".
-        static const int channel_bytes_shift[] = {0, 1, 0, 1, 3, 1, 1, 1, 0, 1, 2, 0, 1, 2, 1, 2};
-        // Indexed by hsa_ext_image_channel_order_t.
-        static const int channel_count_shift[] = {0, 0, 1, 1, 3, 1, 3, 2, 2, 2, 2, 2, 3, 2, 2, 2, 0, 0, 0, 0};
-        const unsigned int CONSTANT_SPACE *image = (const unsigned int CONSTANT_SPACE *)surfobj;
-        int by_type = channel_bytes_shift[__ockl_image_channel_data_type_2D(image)];
-        x = by_type == 3 ? x / 3 : x >> by_type;
-        int by_order = channel_count_shift[__ockl_image_channel_order_2D(image)];
-        return by_order == 3 ? x / 3 : x >> by_order;
-    }
-
-    // Raw values ride in the four 32 bit lanes of the store, each element widened
-    // and reinterpreted rather than converted - again as HIP does it.
-    static v4f32 raw_lanes(uint32_t a, uint32_t b, uint32_t c, uint32_t d) __device__
-    {
-        return v4f32{std::bit_cast<float>(a), std::bit_cast<float>(b),
-                     std::bit_cast<float>(c), std::bit_cast<float>(d)};
-    }
-
-    // sust.b on a surface whose channels are narrower than 32 bits.
-    //
-    // The image store converts: it takes float lanes and encodes them in the surface's own format. A
-    // raw b16 or b32 value reinterpreted as a float lane is therefore a different number, and for a
-    // HALF_FLOAT surface the encoder turns the denormal garbage into zero. So the raw channel bits
-    // are decoded into the value the encoder maps back to those same bits (half bits to the exact
-    // float, normalised integers to bits / scale, integers as themselves), and a store that covers
-    // a pixel only in part merges with what the pixel holds. One store may span several pixels: the
-    // R16F history of the upscaler writes two texels with one b32.
-    //
-    // Channel types are hsa_ext_image_channel_type_t, orders hsa_ext_image_channel_order_t.
-    // Integer clamping is done on integers and every conversion is int32 <-> float, the forms the
-    // constrained (strict floating point) build of this file can lower.
-    static int raw_channel_bytes(int data_type) __device__
-    {
-        switch (data_type)
-        {
-        case 0:  // SNORM_INT8
-        case 2:  // UNORM_INT8
-        case 8:  // SIGNED_INT8
-        case 11: // UNSIGNED_INT8
-            return 1;
-        case 1:  // SNORM_INT16
-        case 3:  // UNORM_INT16
-        case 9:  // SIGNED_INT16
-        case 12: // UNSIGNED_INT16
-        case 14: // HALF_FLOAT
-            return 2;
-        case 10: // SIGNED_INT32
-        case 13: // UNSIGNED_INT32
-        case 15: // FLOAT
-            return 4;
-        default: // packed formats have no per-channel byte layout
-            return 0;
-        }
-    }
-
-    static int raw_channel_count(int order) __device__
-    {
-        switch (order)
-        {
-        case 3: // RG
-        case 4: // RGX
-        case 5: // RA
-            return 2;
-        case 6:  // RGB
-        case 12: // SRGB
-            return 3;
-        case 7:  // RGBX
-        case 8:  // RGBA
-        case 9:  // BGRA
-        case 10: // ARGB
-        case 11: // ABGR
-        case 13: // SRGBX
-        case 14: // SRGBA
-        case 15: // SBGRA
-            return 4;
-        default:
-            return 1;
-        }
-    }
-
-    // The float lane a memory channel travels in, and the inverse (-1: the lane holds no channel).
-    static int raw_channel_lane(int order, int channel) __device__
-    {
-        switch (order)
-        {
-        case 0: // A
-            return 3;
-        case 5: // RA
-            return channel == 0 ? 0 : 3;
-        case 9:  // BGRA
-        case 15: // SBGRA
-            return channel == 0 ? 2 : channel == 2 ? 0 : channel;
-        case 10: // ARGB
-            return channel == 0 ? 3 : channel - 1;
-        case 11: // ABGR
-            return 3 - channel;
-        default:
-            return channel;
-        }
-    }
-
-    static int raw_lane_channel(int order, int lane, int channels) __device__
-    {
-        switch (order)
-        {
-        case 0: // A
-            return lane == 3 ? 0 : -1;
-        case 5: // RA
-            return lane == 0 ? 0 : (lane == 3 ? 1 : -1);
-        case 9:  // BGRA
-        case 15: // SBGRA
-            return lane == 0 ? 2 : (lane == 2 ? 0 : lane);
-        case 10: // ARGB
-            return lane == 3 ? 0 : lane + 1;
-        case 11: // ABGR
-            return 3 - lane;
-        default:
-            return lane < channels ? lane : -1;
-        }
-    }
-
-    // Half <-> float on the bits, so a half denormal survives a kernel compiled to flush them.
-    static float raw_half_to_float(uint32_t bits) __device__
-    {
-        uint32_t sign = (bits & 0x8000u) << 16;
-        uint32_t exponent = (bits >> 10) & 0x1fu;
-        uint32_t mantissa = bits & 0x3ffu;
-        if (exponent == 0)
-        {
-            float magnitude = float(int32_t(mantissa)) * 0x1p-24f;
-            return std::bit_cast<float>(std::bit_cast<uint32_t>(magnitude) | sign);
-        }
-        if (exponent == 0x1f)
-            return std::bit_cast<float>(sign | 0x7f800000u | (mantissa << 13));
-        return std::bit_cast<float>(sign | ((exponent + 112u) << 23) | (mantissa << 13));
-    }
-
-    static uint32_t raw_float_to_half(float value) __device__
-    {
-        uint32_t bits = std::bit_cast<uint32_t>(value);
-        uint32_t sign = (bits >> 16) & 0x8000u;
-        uint32_t exponent = (bits >> 23) & 0xffu;
-        uint32_t mantissa = bits & 0x7fffffu;
-        if (exponent == 0xff)
-            return sign | 0x7c00u | (mantissa != 0 ? 0x200u | (mantissa >> 13) : 0u);
-        int half_exponent = int(exponent) - 112;
-        if (half_exponent >= 31)
-            return sign | 0x7c00u;
-        uint32_t shift = 13;
-        if (half_exponent <= 0)
-        {
-            if (half_exponent < -10)
-                return sign;
-            mantissa |= 0x800000u;
-            shift = uint32_t(14 - half_exponent);
-            half_exponent = 0;
-        }
-        uint32_t half_mantissa = mantissa >> shift;
-        uint32_t remainder = mantissa & ((1u << shift) - 1u);
-        uint32_t halfway = 1u << (shift - 1u);
-        uint32_t result = sign | (uint32_t(half_exponent) << 10);
-        result += half_mantissa & (half_exponent == 0 ? 0x7ffu : 0x3ffu);
-        if (remainder > halfway || (remainder == halfway && (half_mantissa & 1u)))
-            result++;
-        return result;
-    }
-
-    static int32_t raw_clamp(int32_t value, int32_t low, int32_t high) __device__
-    {
-        return value < low ? low : (value > high ? high : value);
-    }
-
-    static float raw_decode_channel(uint32_t bits, int data_type) __device__
-    {
-        switch (data_type)
-        {
-        case 0: // SNORM_INT8
-            return float(raw_clamp(int32_t(int8_t(bits)), -127, 127)) / 127.0f;
-        case 1: // SNORM_INT16
-            return float(raw_clamp(int32_t(int16_t(bits)), -32767, 32767)) / 32767.0f;
-        case 2: // UNORM_INT8
-            return float(int32_t(bits & 0xffu)) / 255.0f;
-        case 3: // UNORM_INT16
-            return float(int32_t(bits & 0xffffu)) / 65535.0f;
-        case 8: // SIGNED_INT8
-            return std::bit_cast<float>(int32_t(int8_t(bits)));
-        case 9: // SIGNED_INT16
-            return std::bit_cast<float>(int32_t(int16_t(bits)));
-        case 14: // HALF_FLOAT
-            return raw_half_to_float(bits);
-        default: // unsigned integers: the bits are the value
-            return std::bit_cast<float>(bits);
-        }
-    }
-
-    static uint32_t raw_encode_channel(float value, int data_type) __device__
-    {
-        switch (data_type)
-        {
-        case 0: // SNORM_INT8
-            return uint32_t(raw_clamp(int32_t(floorf(value * 127.0f + 0.5f)), -127, 127)) & 0xffu;
-        case 1: // SNORM_INT16
-            return uint32_t(raw_clamp(int32_t(floorf(value * 32767.0f + 0.5f)), -32767, 32767)) & 0xffffu;
-        case 2: // UNORM_INT8
-            return uint32_t(raw_clamp(int32_t(floorf(value * 255.0f + 0.5f)), 0, 255));
-        case 3: // UNORM_INT16
-            return uint32_t(raw_clamp(int32_t(floorf(value * 65535.0f + 0.5f)), 0, 65535));
-        case 14: // HALF_FLOAT
-            return raw_float_to_half(value);
-        default:
-            return std::bit_cast<uint32_t>(value);
-        }
-    }
-
-    // The pixel's channels are kept in scalars chosen by conditionals: a byte array indexed at run
-    // time becomes a <16 x i8> vector that AMDGPU instruction selection cannot take once this is
-    // inlined into a large kernel.
-    static uint32_t raw_select(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3, int channel) __device__
-    {
-        return channel == 0 ? c0 : (channel == 1 ? c1 : (channel == 2 ? c2 : c3));
-    }
-
-    static float raw_select_lane(v4f32 value, int lane) __device__
-    {
-        return lane == 0 ? value.x : (lane == 1 ? value.y : (lane == 2 ? value.z : value.w));
-    }
-
-    // Overwrites the bytes of one channel that the store covers. `offset` is where the stored data
-    // starts, counted from the first byte of the pixel (negative when the pixel begins inside it).
-    static uint32_t raw_merge_channel(uint32_t bits, int channel, int channel_bytes, uint64_t data,
-                                      int offset, int byte_count) __device__
-    {
-        for (int b = 0; b < 4; b++)
-        {
-            int relative = channel * channel_bytes + b - offset;
-            if (b < channel_bytes && relative >= 0 && relative < byte_count)
-            {
-                uint32_t byte = uint32_t((data >> (8 * relative)) & 0xffu);
-                bits = (bits & ~(0xffu << (8 * b))) | (byte << (8 * b));
-            }
-        }
-        return bits;
-    }
-
-    static float raw_lane_value(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3, int order, int lane,
-                                int channels, int data_type) __device__
-    {
-        int channel = raw_lane_channel(order, lane, channels);
-        if (channel < 0)
-            return 0.0f;
-        return raw_decode_channel(raw_select(c0, c1, c2, c3, channel), data_type);
-    }
-
-    // Stores byte_count (at most 8) little-endian bytes of data at byte offset byte_x of row y.
-    [[clang::noinline]]
-    static void store_raw_2d(uint64_t surfobj, int32_t byte_x, int32_t y, uint64_t data, int byte_count,
-                             v4f32 lanes) __device__
-    {
-        __device__ int __ockl_image_channel_data_type_2D(const unsigned int CONSTANT_SPACE *);
-        __device__ int __ockl_image_channel_order_2D(const unsigned int CONSTANT_SPACE *);
-        __device__ v4f32 __ockl_image_load_2D(const unsigned int CONSTANT_SPACE *, v2s32);
-        const unsigned int CONSTANT_SPACE *image = (const unsigned int CONSTANT_SPACE *)surfobj;
-        int data_type = __ockl_image_channel_data_type_2D(image);
-        int order = __ockl_image_channel_order_2D(image);
-        int channel_bytes = raw_channel_bytes(data_type);
-        if (channel_bytes == 0)
-        {
-            // Packed formats have no per-channel layout to decode: the raw bits go in as lanes, each
-            // store spelling its own.
-            v2s32 coord = {byte_x_to_sample_x(surfobj, byte_x), y};
-            store_2D(surfobj, coord, lanes);
-            return;
-        }
-        // .zero clamping drops out-of-bounds stores; a negative X never hits a pixel.
-        if (byte_x < 0)
-            return;
-        int channels = raw_channel_count(order);
-        int pixel_bytes = channel_bytes * channels;
-        int first = byte_x / pixel_bytes;
-        int last = (byte_x + byte_count - 1) / pixel_bytes;
-        for (int pixel = first; pixel <= last; pixel++)
-        {
-            int start = pixel * pixel_bytes;
-            int offset = byte_x - start;
-            uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-            v2s32 coordinates = {pixel, y};
-            if (offset > 0 || offset + byte_count < pixel_bytes)
-            {
-                // The store covers the pixel only in part: the rest keeps what it holds.
-                v4f32 loaded = __ockl_image_load_2D(image, coordinates);
-                c0 = raw_encode_channel(raw_select_lane(loaded, raw_channel_lane(order, 0)), data_type);
-                c1 = raw_encode_channel(raw_select_lane(loaded, raw_channel_lane(order, 1)), data_type);
-                c2 = raw_encode_channel(raw_select_lane(loaded, raw_channel_lane(order, 2)), data_type);
-                c3 = raw_encode_channel(raw_select_lane(loaded, raw_channel_lane(order, 3)), data_type);
-            }
-            c0 = raw_merge_channel(c0, 0, channel_bytes, data, offset, byte_count);
-            c1 = raw_merge_channel(c1, 1, channel_bytes, data, offset, byte_count);
-            c2 = raw_merge_channel(c2, 2, channel_bytes, data, offset, byte_count);
-            c3 = raw_merge_channel(c3, 3, channel_bytes, data, offset, byte_count);
-            v4f32 value = {raw_lane_value(c0, c1, c2, c3, order, 0, channels, data_type),
-                           raw_lane_value(c0, c1, c2, c3, order, 1, channels, data_type),
-                           raw_lane_value(c0, c1, c2, c3, order, 2, channels, data_type),
-                           raw_lane_value(c0, c1, c2, c3, order, 3, channels, data_type)};
-            store_2D(surfobj, coordinates, value);
-        }
-    }
-
-    void FUNC(sustobj_b_2d_b32)(uint64_t surfobj, v2s32 coord, uint32_t data)
-    {
-        store_raw_2d(surfobj, coord.x, coord.y, data, 4, raw_lanes(data, 0, 0, 0));
-    }
-
-    void FUNC(sustobj_b_2d_b16)(uint64_t surfobj, v2s32 coord, uint16_t data)
-    {
-        store_raw_2d(surfobj, coord.x, coord.y, data, 2, raw_lanes(data, 0, 0, 0));
-    }
-
-    void FUNC(sustobj_b_2d_b8)(uint64_t surfobj, v2s32 coord, uint8_t data)
-    {
-        store_raw_2d(surfobj, coord.x, coord.y, data, 1, raw_lanes(data, 0, 0, 0));
-    }
-
-    void FUNC(sustobj_b_2d_v2_b16)(uint64_t surfobj, v2s32 coord, v2u16 data)
-    {
-        store_raw_2d(surfobj, coord.x, coord.y, uint64_t(data.x) | (uint64_t(data.y) << 16), 4,
-                     raw_lanes(data.x, data.y, 0, 0));
-    }
-
-    void FUNC(sustobj_b_2d_v4_b16)(uint64_t surfobj, v2s32 coord, v4u16 data)
-    {
-        store_raw_2d(surfobj, coord.x, coord.y,
-                     uint64_t(data.x) | (uint64_t(data.y) << 16) | (uint64_t(data.z) << 32) | (uint64_t(data.w) << 48), 8,
-                     raw_lanes(data.x, data.y, data.z, data.w));
-    }
-
-    void FUNC(sustobj_b_2d_v4_b8)(uint64_t surfobj, v2s32 coord, v4u8 data)
-    {
-        store_raw_2d(surfobj, coord.x, coord.y,
-                     uint64_t(data.x) | (uint64_t(data.y) << 8) | (uint64_t(data.z) << 16) | (uint64_t(data.w) << 24), 4,
-                     raw_lanes(data.x, data.y, data.z, data.w));
-    }
-
     void FUNC(sustobj_p_2d_v2_b32)(uint64_t surfobj, v2s32 coord, v2s32 data)
     {
         // A two channel surface: the other two lanes are ignored by the descriptor.
         v4f32 lanes = {std::bit_cast<float>(data.x), std::bit_cast<float>(data.y), 0.0f, 0.0f};
         store_2D(surfobj, coord, lanes);
-    }
-
-    // suld.b: raw bits, with x in bytes like sust.b. The four lanes of the load
-    // are reinterpreted, not converted.
-    static v4f32 load_2D(uint64_t surfobj, v2s32 coord) __device__
-    {
-        __device__ v4f32 __ockl_image_load_2D(const unsigned int CONSTANT_SPACE *, v2s32);
-        return __ockl_image_load_2D((const unsigned int CONSTANT_SPACE *)surfobj, coord);
-    }
-
-    v4s32 FUNC(suldobj_b_2d_v4_b32)(uint64_t surfobj, v2s32 coord)
-    {
-        coord.x = byte_x_to_sample_x(surfobj, coord.x);
-        return std::bit_cast<v4s32>(load_2D(surfobj, coord));
     }
 
     void FUNC(sustobj_p_2d_b32)(uint64_t surfobj, v2s32 coord, s32 data)
@@ -2155,6 +1820,490 @@ extern "C"
     tex_3d(s32, s32);
     tex_3d(f32, s32);
     tex_3d(s32, f32);
+}
+
+template <size_t Size>
+struct surface_pixel_type
+{
+    using type = std::conditional_t<Size <= sizeof(float), float,
+                                    std::conditional_t<Size == sizeof(v2f32), v2f32, v4f32>>;
+};
+
+template <typename T>
+using surface_pixel_type_t = typename surface_pixel_type<sizeof(T)>::type;
+
+template <typename To, typename From>
+constexpr To zext_or_trunc(From from) noexcept
+{
+    std::array<std::byte, sizeof(To)> buffer{};
+    memcpy(buffer.data(), &from, std::min(sizeof(To), sizeof(From)));
+    return std::bit_cast<To>(buffer);
+}
+
+template <typename T>
+struct UnpackedCoord
+{
+    uint64_t surfobj;
+    uint32_t shift;
+    T coord;
+};
+
+static UnpackedCoord<int32_t> unpack_coord(uint64_t surfobj, int32_t x) __device__
+{
+    uint64_t mask = (1ULL << RESERVED_SURFACE_BOTTOM_BITS) - 1ULL;
+    uint64_t shift = surfobj & mask;
+    return {adjust_surfobj(surfobj), static_cast<uint32_t>(shift), x >> shift};
+}
+
+static UnpackedCoord<v2s32> unpack_coord(uint64_t surfobj, v2s32 coord) __device__
+{
+    UnpackedCoord<int32_t> unpacked = unpack_coord(surfobj, coord.x);
+    return {unpacked.surfobj, unpacked.shift, v2s32{unpacked.coord, coord.y}};
+}
+
+static UnpackedCoord<v4s32> unpack_coord(uint64_t surfobj, v4s32 coord) __device__
+{
+    UnpackedCoord<int32_t> unpacked = unpack_coord(surfobj, coord.x);
+    return {unpacked.surfobj, unpacked.shift, v4s32{unpacked.coord, coord.y, coord.z, coord.w}};
+}
+
+static void surface_store_impl(v8s32 surface, int32_t raw_coord, float value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_1d_f32(f32, uint32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.1d.f32.i32");
+    __llvm_amdgcn_image_store_pck_1d_f32(value, 0x1, raw_coord, surface, 0, 0);
+}
+
+static void surface_store_impl(v8s32 surface, int32_t raw_coord, v2f32 value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_1d_v2f32(v2f32, uint32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.1d.v2f32.i32");
+    __llvm_amdgcn_image_store_pck_1d_v2f32(value, 0x3, raw_coord, surface, 0, 0);
+}
+
+static void surface_store_impl(v8s32 surface, int32_t raw_coord, v4f32 value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_1d_v4f32(v4f32, uint32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.1d.v4f32.i32");
+    __llvm_amdgcn_image_store_pck_1d_v4f32(value, 0xf, raw_coord, surface, 0, 0);
+}
+
+static void surface_store_impl(v8s32 surface, v2s32 raw_coord, float value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_2d_f32(f32, uint32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.2d.f32.i32");
+    __llvm_amdgcn_image_store_pck_2d_f32(value, 0x1, raw_coord.x, raw_coord.y, surface, 0, 0);
+}
+
+static void surface_store_impl(v8s32 surface, v2s32 raw_coord, v2f32 value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_2d_v2f32(v2f32, uint32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.2d.v2f32.i32");
+    __llvm_amdgcn_image_store_pck_2d_v2f32(value, 0x3, raw_coord.x, raw_coord.y, surface, 0, 0);
+}
+
+static void surface_store_impl(v8s32 surface, v2s32 raw_coord, v4f32 value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_2d_v4f32(v4f32, uint32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.2d.v4f32.i32");
+    __llvm_amdgcn_image_store_pck_2d_v4f32(value, 0xf, raw_coord.x, raw_coord.y, surface, 0, 0);
+}
+
+static void surface_store_impl(v8s32 surface, v4s32 raw_coord, float value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_3d_f32(f32, uint32_t, int32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.3d.f32.i32");
+    __llvm_amdgcn_image_store_pck_3d_f32(value, 0x1, raw_coord.x, raw_coord.y, raw_coord.z, surface, 0, 0);
+}
+
+static void surface_store_impl(v8s32 surface, v4s32 raw_coord, v2f32 value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_3d_v2f32(v2f32, uint32_t, int32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.3d.v2f32.i32");
+    __llvm_amdgcn_image_store_pck_3d_v2f32(value, 0x3, raw_coord.x, raw_coord.y, raw_coord.z, surface, 0, 0);
+}
+
+static void surface_store_impl(v8s32 surface, v4s32 raw_coord, v4f32 value) __device__
+{
+    __attribute__((device)) void __llvm_amdgcn_image_store_pck_3d_v4f32(v4f32, uint32_t, int32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.store.pck.3d.v4f32.i32");
+    __llvm_amdgcn_image_store_pck_3d_v4f32(value, 0xf, raw_coord.x, raw_coord.y, raw_coord.z, surface, 0, 0);
+}
+
+template <typename T>
+static T surface_load_impl(v8s32 surface, int32_t raw_coord) __device__
+{
+    if constexpr (std::is_same_v<T, float>)
+    {
+        __attribute__((device)) f32 __llvm_amdgcn_image_load_pck_1d_f32(uint32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.1d.f32.i32");
+        return __llvm_amdgcn_image_load_pck_1d_f32(0x1, raw_coord, surface, 0, 0);
+    }
+    else if constexpr (std::is_same_v<T, v2f32>)
+    {
+        __attribute__((device)) v2f32 __llvm_amdgcn_image_load_pck_1d_v2f32(uint32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.1d.v2f32.i32");
+        return __llvm_amdgcn_image_load_pck_1d_v2f32(0x3, raw_coord, surface, 0, 0);
+    }
+    else
+    {
+        static_assert(std::is_same_v<T, v4f32>, "unsupported surface load type");
+        __attribute__((device)) v4f32 __llvm_amdgcn_image_load_pck_1d_v4f32(uint32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.1d.v4f32.i32");
+        return __llvm_amdgcn_image_load_pck_1d_v4f32(0xf, raw_coord, surface, 0, 0);
+    }
+}
+
+template <typename T>
+static T surface_load_impl(v8s32 surface, v2s32 raw_coord) __device__
+{
+    if constexpr (std::is_same_v<T, float>)
+    {
+        __attribute__((device)) f32 __llvm_amdgcn_image_load_pck_2d_f32(uint32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.2d.f32.i32");
+        return __llvm_amdgcn_image_load_pck_2d_f32(0x1, raw_coord.x, raw_coord.y, surface, 0, 0);
+    }
+    else if constexpr (std::is_same_v<T, v2f32>)
+    {
+        __attribute__((device)) v2f32 __llvm_amdgcn_image_load_pck_2d_v2f32(uint32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.2d.v2f32.i32");
+        return __llvm_amdgcn_image_load_pck_2d_v2f32(0x3, raw_coord.x, raw_coord.y, surface, 0, 0);
+    }
+    else
+    {
+        static_assert(std::is_same_v<T, v4f32>, "unsupported surface load type");
+        __attribute__((device)) v4f32 __llvm_amdgcn_image_load_pck_2d_v4f32(uint32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.2d.v4f32.i32");
+        return __llvm_amdgcn_image_load_pck_2d_v4f32(0xf, raw_coord.x, raw_coord.y, surface, 0, 0);
+    }
+}
+
+template <typename T>
+static T surface_load_impl(v8s32 surface, v4s32 raw_coord) __device__
+{
+    if constexpr (std::is_same_v<T, float>)
+    {
+        __attribute__((device)) f32 __llvm_amdgcn_image_load_pck_3d_f32(uint32_t, int32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.3d.f32.i32");
+        return __llvm_amdgcn_image_load_pck_3d_f32(0x1, raw_coord.x, raw_coord.y, raw_coord.z, surface, 0, 0);
+    }
+    else if constexpr (std::is_same_v<T, v2f32>)
+    {
+        __attribute__((device)) v2f32 __llvm_amdgcn_image_load_pck_3d_v2f32(uint32_t, int32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.3d.v2f32.i32");
+        return __llvm_amdgcn_image_load_pck_3d_v2f32(0x3, raw_coord.x, raw_coord.y, raw_coord.z, surface, 0, 0);
+    }
+    else
+    {
+        static_assert(std::is_same_v<T, v4f32>, "unsupported surface load type");
+        __attribute__((device)) v4f32 __llvm_amdgcn_image_load_pck_3d_v4f32(uint32_t, int32_t, int32_t, int32_t, v8s32, int32_t, int32_t) __asm("llvm.amdgcn.image.load.pck.3d.v4f32.i32");
+        return __llvm_amdgcn_image_load_pck_3d_v4f32(0xf, raw_coord.x, raw_coord.y, raw_coord.z, surface, 0, 0);
+    }
+}
+
+// The pixel `index` pixels further along x.
+static int32_t advance_x(int32_t coord, uint32_t index) __device__ { return coord + int32_t(index); }
+static v2s32 advance_x(v2s32 coord, uint32_t index) __device__ { return v2s32{coord.x + int32_t(index), coord.y}; }
+static v4s32 advance_x(v4s32 coord, uint32_t index) __device__ { return v4s32{coord.x + int32_t(index), coord.y, coord.z, coord.w}; }
+
+static int32_t get_x(int32_t coord) __device__ { return coord; }
+static int32_t get_x(v2s32 coord) __device__ { return coord.x; }
+static int32_t get_x(v4s32 coord) __device__ { return coord.x; }
+
+// sust/suld take x in bytes and move as many bytes as their vector holds, whatever the pixel of the
+// surface is. A program can therefore store four bytes into a surface of 16 bit pixels, and then it
+// means two pixels (the networks do: two texels of a half float surface per store). The pck image
+// instructions move one pixel, so a transfer wider than the pixel is made of several of them, each
+// taking the next bytes of the value.
+//
+// The pixel size is only known at run time (it is in the handle), but the value's size is not, so the
+// split is written once per pixel size the value is wider than, each with every piece at a constant
+// offset: the pieces stay in registers. A loop over a byte array indexed at run time put the value in
+// scratch memory and cost the upscaler half its speed.
+template <uint32_t Pixel>
+struct pixel_piece
+{
+    using type = std::conditional_t<Pixel <= sizeof(float), float,
+                                    std::conditional_t<Pixel == sizeof(v2f32), v2f32, v4f32>>;
+};
+
+template <uint32_t Pixel, typename T, typename Coord>
+static void surface_store_split(v8s32 surface, Coord coord, T value) __device__
+{
+    static_assert(sizeof(T) % Pixel == 0);
+#pragma unroll
+    for (uint32_t piece = 0; piece < sizeof(T) / Pixel; piece++)
+    {
+        typename pixel_piece<Pixel>::type pixel{};
+        memcpy(&pixel, reinterpret_cast<const uint8_t *>(&value) + piece * Pixel, Pixel);
+        surface_store_impl(surface, advance_x(coord, piece), pixel);
+    }
+}
+
+template <uint32_t Pixel, typename T, typename Coord>
+static T surface_load_split(v8s32 surface, Coord coord) __device__
+{
+    static_assert(sizeof(T) % Pixel == 0);
+    T result{};
+#pragma unroll
+    for (uint32_t piece = 0; piece < sizeof(T) / Pixel; piece++)
+    {
+        typename pixel_piece<Pixel>::type pixel = surface_load_impl<typename pixel_piece<Pixel>::type>(surface, advance_x(coord, piece));
+        memcpy(reinterpret_cast<uint8_t *>(&result) + piece * Pixel, &pixel, Pixel);
+    }
+    return result;
+}
+
+// Everything but the common case: a transfer as wide as the pixel. It stays a call. Inlined into a
+// kernel as large as the upscaler's, every path of it was code the kernel carried registers for, and the
+// kernel that makes the most such stores ran five times slower.
+template <typename T, typename Coord>
+[[clang::noinline]] static void surface_store_uncommon(uint64_t raw_surfobj, Coord raw_coord, T value) __device__
+{
+    auto [surfobj, shift, coord] = unpack_coord(raw_surfobj, raw_coord);
+    uint32_t actual_pixel_size = 1U << shift;
+    v8s32 surface = *(GLOBAL_SPACE v8s32 *)surfobj;
+    if (actual_pixel_size < sizeof(T))
+    {
+        if constexpr (sizeof(T) > 1)
+        {
+            if (actual_pixel_size == 1)
+                surface_store_split<1>(surface, coord, value);
+            else
+            {
+                if constexpr (sizeof(T) > 2)
+                {
+                    if (actual_pixel_size == 2)
+                        surface_store_split<2>(surface, coord, value);
+                    else
+                    {
+                        if constexpr (sizeof(T) > 4)
+                        {
+                            if (actual_pixel_size == 4)
+                                surface_store_split<4>(surface, coord, value);
+                            else
+                            {
+                                if constexpr (sizeof(T) > 8)
+                                    surface_store_split<8>(surface, coord, value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else if (sizeof(T) < sizeof(v4f32))
+    {
+        // The store covers part of one pixel: the bytes it does not reach keep their value, and the
+        // ones it reaches start where x says, which the pixel index has lost.
+        v4f32 tmp = surface_load_impl<v4f32>(surface, coord);
+        uint32_t within = uint32_t(get_x(raw_coord)) & (actual_pixel_size - 1);
+        memcpy(reinterpret_cast<uint8_t *>(&tmp) + within, &value, sizeof(T));
+        surface_store_impl(surface, coord, tmp);
+    }
+    else
+    {
+        surface_store_impl(surface, coord, zext_or_trunc<surface_pixel_type_t<T>>(value));
+    }
+}
+
+template <typename T, typename Coord>
+void surface_store(uint64_t raw_surfobj, Coord raw_coord, T value) __device__
+{
+    if ((raw_surfobj & ((1ULL << RESERVED_SURFACE_BOTTOM_BITS) - 1)) == uint64_t(__builtin_ctz(sizeof(T)))) [[likely]]
+    {
+        auto [surfobj, shift, coord] = unpack_coord(raw_surfobj, raw_coord);
+        surface_store_impl(*(GLOBAL_SPACE v8s32 *)surfobj, coord, zext_or_trunc<surface_pixel_type_t<T>>(value));
+    }
+    else
+        surface_store_uncommon(raw_surfobj, raw_coord, value);
+}
+
+template <typename T, typename Coord>
+[[clang::noinline]] static T surface_load_uncommon(uint64_t raw_surfobj, Coord raw_coord) __device__
+{
+    auto [surfobj, shift, coord] = unpack_coord(raw_surfobj, raw_coord);
+    uint32_t actual_pixel_size = 1U << shift;
+    v8s32 surface = *(GLOBAL_SPACE v8s32 *)surfobj;
+    if (actual_pixel_size < sizeof(T))
+    {
+        // Several pixels make up the value: see surface_store.
+        if constexpr (sizeof(T) > 1)
+        {
+            if (actual_pixel_size == 1)
+                return surface_load_split<1, T>(surface, coord);
+            if constexpr (sizeof(T) > 2)
+            {
+                if (actual_pixel_size == 2)
+                    return surface_load_split<2, T>(surface, coord);
+                if constexpr (sizeof(T) > 4)
+                {
+                    if (actual_pixel_size == 4)
+                        return surface_load_split<4, T>(surface, coord);
+                    if constexpr (sizeof(T) > 8)
+                        return surface_load_split<8, T>(surface, coord);
+                }
+            }
+        }
+    }
+    return zext_or_trunc<T, surface_pixel_type_t<T>>(surface_load_impl<surface_pixel_type_t<T>>(surface, coord));
+}
+
+template <typename T, typename Coord>
+T surface_load(uint64_t raw_surfobj, Coord raw_coord) __device__
+{
+    if ((raw_surfobj & ((1ULL << RESERVED_SURFACE_BOTTOM_BITS) - 1)) >= uint64_t(__builtin_ctz(sizeof(T)))) [[likely]]
+    {
+        auto [surfobj, shift, coord] = unpack_coord(raw_surfobj, raw_coord);
+        return zext_or_trunc<T, surface_pixel_type_t<T>>(surface_load_impl<surface_pixel_type_t<T>>(*(GLOBAL_SPACE v8s32 *)surfobj, coord));
+    }
+    return surface_load_uncommon<T>(raw_surfobj, raw_coord);
+}
+
+extern "C"
+{
+#define SULD_ARGS_1d int32_t
+#define SULD_ARGS_2d int32_t, int32_t
+#define SULD_ARGS_3d int32_t, int32_t, int32_t
+
+#define SULD_COORD_1d int32_t
+#define SULD_COORD_2d v2s32
+#define SULD_COORD_3d v4s32
+
+// `suld`/`sust` pack raw pixel bytes contiguously into the fewest 32-bit float
+// lanes instead of spreading them one component per lane:
+//   * <= 4 bytes  -> f32
+//   * <= 8 bytes  -> v2f32
+//   * <= 16 bytes -> v4f32
+// Pixel byte 0 resides in the least significant byte of lane 0, so the packed
+// value is just the little-endian byte sequence of the result components.
+// dmask selects the valid packed lanes and is derived from the pixel byte
+// size, not the component count.
+#define SULD_PACKED_PIXEL_v1_b8 f32
+#define SULD_PACKED_PIXEL_v2_b8 f32
+#define SULD_PACKED_PIXEL_v4_b8 f32
+#define SULD_PACKED_PIXEL_v1_b16 f32
+#define SULD_PACKED_PIXEL_v2_b16 f32
+#define SULD_PACKED_PIXEL_v4_b16 v2f32
+#define SULD_PACKED_PIXEL_v1_b32 f32
+#define SULD_PACKED_PIXEL_v2_b32 v2f32
+#define SULD_PACKED_PIXEL_v4_b32 v4f32
+
+#define SULD_PACKED_DMASK_v1_b8 0x1
+#define SULD_PACKED_DMASK_v2_b8 0x1
+#define SULD_PACKED_DMASK_v4_b8 0x1
+#define SULD_PACKED_DMASK_v1_b16 0x1
+#define SULD_PACKED_DMASK_v2_b16 0x1
+#define SULD_PACKED_DMASK_v4_b16 0x3
+#define SULD_PACKED_DMASK_v1_b32 0x1
+#define SULD_PACKED_DMASK_v2_b32 0x3
+#define SULD_PACKED_DMASK_v4_b32 0xf
+
+#define SULD_UNPACK_ARGS_1d coord
+#define SULD_UNPACK_ARGS_2d coord.x, coord.y
+#define SULD_UNPACK_ARGS_3d coord.x, coord.y, coord.z
+
+#define STRINGIFY2(X) #X
+#define STRINGIFY(X) STRINGIFY2(X)
+
+    using b8 = uint8_t;
+    using v1_b8 = uint8_t;
+    typedef uint8_t v2_b8 __attribute__((ext_vector_type(2)));
+    typedef uint8_t v4_b8 __attribute__((ext_vector_type(4)));
+
+    using b16 = uint16_t;
+    using v1_b16 = uint16_t;
+    typedef uint16_t v2_b16 __attribute__((ext_vector_type(2)));
+    typedef uint16_t v4_b16 __attribute__((ext_vector_type(4)));
+
+    using b32 = uint32_t;
+    using v1_b32 = uint32_t;
+    typedef uint32_t v2_b32 __attribute__((ext_vector_type(2)));
+    typedef uint32_t v4_b32 __attribute__((ext_vector_type(4)));
+
+    using b64 = uint64_t;
+    using v1_b64 = uint64_t;
+    typedef uint64_t v2_b64 __attribute__((ext_vector_type(2)));
+    typedef uint64_t v4_b64 __attribute__((ext_vector_type(4)));
+
+#define suld(RETURN_VEC, RETURN_TYPE, COORD)                                                                                                                   \
+    RETURN_VEC##_##RETURN_TYPE FUNC(suldobj_b_##COORD##_##RETURN_VEC##_##RETURN_TYPE)(uint64_t surfobj, SULD_COORD_##COORD coord)                              \
+    {                                                                                                                                                          \
+        return surface_load<RETURN_VEC##_##RETURN_TYPE>(surfobj, coord);                                                                                       \
+    }                                                                                                                                                          \
+                                                                                                                                                               \
+    RETURN_VEC##_##RETURN_TYPE FUNC(suldref_b_##COORD##_##RETURN_VEC##_##RETURN_TYPE)(struct textureReference GLOBAL_SPACE * texref, SULD_COORD_##COORD coord) \
+    {                                                                                                                                                          \
+        return surface_load<RETURN_VEC##_##RETURN_TYPE>(uint64_t(texref->textureObject), coord);                                                               \
+    }
+
+    suld(v1, b8, 1d);
+    suld(v1, b8, 2d);
+    suld(v1, b8, 3d);
+    suld(v2, b8, 1d);
+    suld(v2, b8, 2d);
+    suld(v2, b8, 3d);
+    suld(v4, b8, 1d);
+    suld(v4, b8, 2d);
+    suld(v4, b8, 3d);
+    suld(v1, b16, 1d);
+    suld(v1, b16, 2d);
+    suld(v1, b16, 3d);
+    suld(v2, b16, 1d);
+    suld(v2, b16, 2d);
+    suld(v2, b16, 3d);
+    suld(v4, b16, 1d);
+    suld(v4, b16, 2d);
+    suld(v4, b16, 3d);
+    suld(v1, b32, 1d);
+    suld(v1, b32, 2d);
+    suld(v1, b32, 3d);
+    suld(v2, b32, 1d);
+    suld(v2, b32, 2d);
+    suld(v2, b32, 3d);
+    suld(v4, b32, 1d);
+    suld(v4, b32, 2d);
+    suld(v4, b32, 3d);
+    suld(v1, b64, 1d);
+    suld(v1, b64, 2d);
+    suld(v1, b64, 3d);
+    suld(v2, b64, 1d);
+    suld(v2, b64, 2d);
+    suld(v2, b64, 3d);
+    // suld(v4_b64, 1d);
+    // suld(v4_b64, 2d);
+    // suld(v4_b64, 3d);
+
+#define sust(RETURN_VEC, RETURN_TYPE, COORD)                                                                                                                               \
+    void FUNC(sustobj_b_##COORD##_##RETURN_VEC##_##RETURN_TYPE)(uint64_t surfobj, SULD_COORD_##COORD coord, RETURN_VEC##_##RETURN_TYPE value)                              \
+    {                                                                                                                                                                      \
+        surface_store(surfobj, coord, value);                                                                                                                              \
+    }                                                                                                                                                                      \
+                                                                                                                                                                           \
+    void FUNC(sustref_b_##COORD##_##RETURN_VEC##_##RETURN_TYPE)(struct textureReference GLOBAL_SPACE * texref, SULD_COORD_##COORD coord, RETURN_VEC##_##RETURN_TYPE value) \
+    {                                                                                                                                                                      \
+        surface_store(uint64_t(texref->textureObject), coord, value);                                                                                                      \
+    }
+
+    sust(v1, b8, 1d);
+    sust(v1, b8, 2d);
+    sust(v1, b8, 3d);
+    sust(v2, b8, 1d);
+    sust(v2, b8, 2d);
+    sust(v2, b8, 3d);
+    sust(v4, b8, 1d);
+    sust(v4, b8, 2d);
+    sust(v4, b8, 3d);
+    sust(v1, b16, 1d);
+    sust(v1, b16, 2d);
+    sust(v1, b16, 3d);
+    sust(v2, b16, 1d);
+    sust(v2, b16, 2d);
+    sust(v2, b16, 3d);
+    sust(v4, b16, 1d);
+    sust(v4, b16, 2d);
+    sust(v4, b16, 3d);
+    sust(v1, b32, 1d);
+    sust(v1, b32, 2d);
+    sust(v1, b32, 3d);
+    sust(v2, b32, 1d);
+    sust(v2, b32, 2d);
+    sust(v2, b32, 3d);
+    sust(v4, b32, 1d);
+    sust(v4, b32, 2d);
+    sust(v4, b32, 3d);
+    sust(v1, b64, 1d);
+    sust(v1, b64, 2d);
+    sust(v1, b64, 3d);
+    sust(v2, b64, 1d);
+    sust(v2, b64, 2d);
+    sust(v2, b64, 3d);
+    // sust(v4_b64, 1d);
+    // sust(v4_b64, 2d);
+    // sust(v4_b64, 3d);
 
     __device__ half __ocml_tanh_f16(half);
     half FUNC(tanh_f16)(half a)

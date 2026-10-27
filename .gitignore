@@ -6,3 +6,6 @@ Cargo.lock
 
 ptx/lib/zluda_ptx_impl.ll
 ptx/lib/zluda_ptx_impl_constrained.ll
+
+# build_bc_msvc.sh keeps the bitcode it replaces beside it
+ptx/lib/*.bc.backup

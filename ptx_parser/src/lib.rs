@@ -2,6 +2,7 @@ use derive_more::Display;
 use logos::Logos;
 use ptx_parser_macros::derive_parser;
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::num::{NonZeroU8, ParseFloatError, ParseIntError};
 use std::{iter, usize};
@@ -299,27 +300,39 @@ fn f32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<f32> {
 }
 
 fn f64<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<f64> {
-    take_error(token::any.verify_map(|(t, _)| match t {
-        Token::F64Hex(f) => Some(match u64::from_str_radix(&f[2..], 16) {
-            Ok(x) => Ok(f64::from_bits(x)),
-            Err(err) => Err((0.0, PtxError::from(err))),
+    take_error(
+        (opt(Token::Minus), token::any).verify_map(|(neg, (t, _))| match (neg, t) {
+            (None, Token::F64Hex(f)) => Some(match u64::from_str_radix(&f[2..], 16) {
+                Ok(x) => Ok(f64::from_bits(x)),
+                Err(err) => Err((0.0, PtxError::from(err))),
+            }),
+            (neg, Token::F64(f)) => {
+                let full_number = if neg.is_some() {
+                    Cow::Owned(format!("-{f}"))
+                } else {
+                    Cow::Borrowed(f)
+                };
+
+                Some(match full_number.parse::<f64>() {
+                    Ok(x) => Ok(x),
+                    Err(err) => Err((0.0, PtxError::from(err))),
+                })
+            }
+            _ => None,
         }),
-        Token::F64(f) => Some(match f.parse::<f64>() {
-            Ok(x) => Ok(x),
-            Err(err) => Err((0.0, PtxError::from(err))),
-        }),
-        _ => None,
-    }))
+    )
     .parse_next(stream)
 }
 
-fn s32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<i32> {
+fn s64<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<i64> {
     take_error((opt(Token::Minus), num).map(|(sign, x)| {
         let (text, radix, _) = x;
-        match i32::from_str_radix(text, radix) {
-            Ok(x) => Ok(if sign.is_some() { -x } else { x }),
-            Err(err) => Err((0, PtxError::from(err))),
-        }
+        let signed_text = if sign.is_some() {
+            Cow::Owned(format!("-{text}"))
+        } else {
+            Cow::Borrowed(text)
+        };
+        i64::from_str_radix(&signed_text, radix).map_err(|err| (0, PtxError::from(err)))
     }))
     .parse_next(stream)
 }
@@ -1012,6 +1025,7 @@ fn method_parameter<'a, 'input: 'a>(
 
 enum ParsedType {
     Texref,
+    Surfref,
     Type {
         align: Option<u32>,
         vector: Option<NonZeroU8>,
@@ -1019,10 +1033,13 @@ enum ParsedType {
     },
 }
 
-fn texref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ParsedType> {
+fn texref_or_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ParsedType> {
     trace(
-        "texref",
-        alt((Token::DotTexref, Token::DotSurfref)).map(|_| ParsedType::Texref),
+        "texref_or_surfref",
+        alt((
+            Token::DotTexref.map(|_| ParsedType::Texref),
+            Token::DotSurfref.map(|_| ParsedType::Surfref),
+        )),
     )
     .parse_next(stream)
 }
@@ -1052,7 +1069,7 @@ fn variable_info<'a, 'input: 'a>(
         "variable_info",
         move |stream: &mut PtxParser<'a, 'input>| {
             alt((
-                parse_if(state_space == StateSpace::Global, texref),
+                parse_if(state_space == StateSpace::Global, texref_or_surfref),
                 variable_info_non_texref.map(|(align, vector, scalar)| ParsedType::Type {
                     align,
                     vector,
@@ -1102,6 +1119,20 @@ fn multi_variable<'a, 'input: 'a>(
                         info: VariableInfo {
                             align: None,
                             v_type: Type::Texref,
+                            state_space,
+                            array_init: Vec::new(),
+                        },
+                        names,
+                    });
+                }
+                ParsedType::Surfref => {
+                    if count.is_some() {
+                        return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
+                    }
+                    return Ok(MultiVariable::Names {
+                        info: VariableInfo {
+                            align: None,
+                            v_type: Type::Surfref,
                             state_space,
                             array_init: Vec::new(),
                         },
@@ -1504,7 +1535,7 @@ impl<Ident> ast::ParsedOperand<Ident> {
         ) -> PResult<ast::ParsedOperand<&'input str>> {
             let main_ident = ident.parse_next(stream)?;
             alt((
-                preceded(Token::Plus, s32)
+                preceded(Token::Plus, s64)
                     .map(move |offset| ast::ParsedOperand::RegOffset(main_ident, offset)),
                 take_error(dot_ident.map(move |suffix| {
                     let vector_index = vector_index(suffix)
@@ -4284,14 +4315,17 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-vote-sync
 
-    vote.sync.mode.pred  d, {!}a, membermask => {
+    vote{.sync}.mode.pred  d, {!}a{, membermask} => {
+        if sync != membermask.is_some() {
+            state.errors.push(PtxError::SyntaxError("vote instruction with inconsistent sync and membermask".to_string()));
+        }
         let (negate, a) = a;
         Instruction::Vote {
             data: VoteDetails {
                 mode,
                 negate
             },
-            arguments: VoteArgs { dst: d, src1: a, src2: Some(membermask) }
+            arguments: VoteArgs { dst: d, src1: a, src2: membermask }
         }
     }
     vote.ballot.b32 d, {!}a => {
@@ -4655,14 +4689,14 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-sust
     // .p converts the values to the surface format and takes the x coordinate in
-    // samples; .b writes raw bits with x in bytes and is deliberately left out for
-    // now, so it keeps showing up as unrecognized instead of silently doing nothing.
+    // samples; it is only here for the 2d, 32 bit form the networks use.
+    // .b writes raw bits with x in bytes.
     // AMD image stores drop out-of-range writes, which is what .zero asks for, so
-    // .trap is accepted but not told apart from it.
+    // .trap and .clamp are accepted but not told apart from it.
     sust.p.2d{.vec}.b32{.sustclamp}  [a, b], c => {
         Instruction::Sust {
             data: SustData {
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 dims: TexDimensions::D2,
                 formatted: true,
                 vector: vec.map(|v| v.len()),
@@ -4673,12 +4707,40 @@ derive_parser!(
         }
     }
     // .cs is the cache-streaming hint: no effect on the result, so it is read and dropped.
+    sust.b.1d{.cs}{.vec}.stype{.sustclamp}  [a, b], c => {
+        let _ = cs;
+        Instruction::Sust {
+            data: SustData {
+                type_: TexType::Ref,
+                dims: TexDimensions::D1,
+                formatted: false,
+                vector: vec.map(|v| v.len()),
+                scalar_type: stype,
+                clamp: sustclamp.unwrap_or(SustClamp::Trap)
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
     sust.b.2d{.cs}{.vec}.stype{.sustclamp}  [a, b], c => {
         let _ = cs;
         Instruction::Sust {
             data: SustData {
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 dims: TexDimensions::D2,
+                formatted: false,
+                vector: vec.map(|v| v.len()),
+                scalar_type: stype,
+                clamp: sustclamp.unwrap_or(SustClamp::Trap)
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+    sust.b.3d{.cs}{.vec}.stype{.sustclamp}  [a, b], c => {
+        let _ = cs;
+        Instruction::Sust {
+            data: SustData {
+                type_: TexType::Ref,
+                dims: TexDimensions::D3,
                 formatted: false,
                 vector: vec.map(|v| v.len()),
                 scalar_type: stype,
@@ -4689,17 +4751,43 @@ derive_parser!(
     }
 
     .vec: VectorPrefix = { .v2, .v4 };
-    .stype: ScalarType = { .b8, .b16, .b32 };
+    .stype: ScalarType = { .b8, .b16, .b32, .b64 };
     .sustclamp: SustClamp = { .trap, .clamp, .zero };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-suld
     // Raw bits, x in bytes, like sust.b. Out-of-range reads come back as zero
     // from AMD image loads, which is what .zero asks for.
+    suld.b.1d{.vec}.stype{.sustclamp}  d, [a, b] => {
+        Instruction::Suld {
+            data: SustData {
+                type_: TexType::Ref,
+                dims: TexDimensions::D1,
+                formatted: false,
+                vector: vec.map(|v| v.len()),
+                scalar_type: stype,
+                clamp: sustclamp.unwrap_or(SustClamp::Trap)
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
+        }
+    }
     suld.b.2d{.vec}.stype{.sustclamp}  d, [a, b] => {
         Instruction::Suld {
             data: SustData {
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 dims: TexDimensions::D2,
+                formatted: false,
+                vector: vec.map(|v| v.len()),
+                scalar_type: stype,
+                clamp: sustclamp.unwrap_or(SustClamp::Trap)
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
+        }
+    }
+    suld.b.3d{.vec}.stype{.sustclamp}  d, [a, b] => {
+        Instruction::Suld {
+            data: SustData {
+                type_: TexType::Ref,
+                dims: TexDimensions::D3,
                 formatted: false,
                 vector: vec.map(|v| v.len()),
                 scalar_type: stype,
@@ -4710,7 +4798,7 @@ derive_parser!(
     }
 
     .vec: VectorPrefix = { .v2, .v4 };
-    .stype: ScalarType = { .b8, .b16, .b32 };
+    .stype: ScalarType = { .b8, .b16, .b32, .b64 };
     .sustclamp: SustClamp = { .trap, .clamp, .zero };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#texture-instructions-tex
@@ -4722,7 +4810,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D1,
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 level: false,
                 gather: None
             },
@@ -4735,7 +4823,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D2,
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 level: false,
                 gather: None
             },
@@ -4748,7 +4836,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D3,
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 level: false,
                 gather: None
             },
@@ -4763,7 +4851,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D2,
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 level: true,
                 gather: None
             },
@@ -4785,7 +4873,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D2,
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 level: false,
                 gather: Some(0)
             },
@@ -4798,7 +4886,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D2,
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 level: false,
                 gather: Some(1)
             },
@@ -4811,7 +4899,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D2,
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 level: false,
                 gather: Some(2)
             },
@@ -4824,7 +4912,7 @@ derive_parser!(
                 dtype,
                 ctype,
                 dims: TexDimensions::D2,
-                type_: TexType::Texref,
+                type_: TexType::Ref,
                 level: false,
                 gather: Some(3)
             },
@@ -5364,5 +5452,28 @@ mod tests {
             result.array_init,
             vec![crate::RegOrImmediate::Imm(crate::ImmediateValue::U64(0))]
         );
+    }
+
+    #[test]
+    fn signed_immediate() {
+        fn parse_value(text: &str) -> crate::ImmediateValue {
+            let tokens = Token::lexer(text)
+                .map(|t| t.map(|t| (t, Span::default())))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut errors = Vec::new();
+            let stream = super::PtxParser {
+                input: &tokens[..],
+                state: PtxParserState::new(text, &mut errors),
+            };
+            let result = super::immediate_value.parse(stream).unwrap();
+            assert!(errors.is_empty());
+            result
+        }
+
+        assert_eq!(parse_value("-42"), crate::ImmediateValue::S64(-42));
+        assert_eq!(parse_value("-1.5"), crate::ImmediateValue::F64(-1.5));
+        assert_eq!(parse_value("-1.5e-2"), crate::ImmediateValue::F64(-0.015));
+        assert_eq!(parse_value("-1.5E+2"), crate::ImmediateValue::F64(-150.0));
     }
 }

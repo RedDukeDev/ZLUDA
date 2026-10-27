@@ -175,6 +175,15 @@ macro_rules! from_cuda_transmute {
                     Ok(x.cast::<*const $to>())
                 }
             }
+
+            impl<'a, E: CudaErrorType> FromCuda<'a, *const $from, E> for &'a $to {
+                fn from_cuda(x: &'a *const $from) -> Result<Self, E> {
+                    match unsafe { x.cast::<$to>().as_ref() } {
+                        Some(x) => Ok(x),
+                        None => Err(E::INVALID_VALUE),
+                    }
+                }
+            }
         )*
     };
 }
@@ -360,7 +369,9 @@ from_cuda_nop!(
     CUfunc_cache,
     CUctxCreateParams,
     cufftHandle,
-    cuda_types::cuda::libraryPropertyType
+    cuda_types::cuda::libraryPropertyType,
+    CUgraphicsResource,
+    CUsharedconfig
 );
 from_cuda_transmute!(
     CUuuid => hipUUID,
@@ -407,11 +418,11 @@ from_cuda_transmute!(
     CUDA_ARRAY_DESCRIPTOR => HIP_ARRAY_DESCRIPTOR,
     CUDA_ARRAY3D_DESCRIPTOR => HIP_ARRAY3D_DESCRIPTOR,
     CUtexref => *mut textureReference,
-    CUsurfref => *mut textureReference,
     CUarray_format => hipArray_Format,
     CUaddress_mode => hipTextureAddressMode,
     CUfilter_mode => hipTextureFilterMode,
-    cufftType_t => hipfft_sys::hipfftType
+    cufftType_t => hipfft_sys::hipfftType,
+    CUgraphicsResource => hipGraphicsResource_t
 );
 
 impl<'a, E: CudaErrorType> FromCuda<'a, *const CUDA_MEMCPY3D, E> for HIP_MEMCPY3D {
