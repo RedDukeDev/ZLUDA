@@ -9,7 +9,7 @@
 // __clang_cuda_complex_builtins.h, which is reached from the HIP runtime
 // wrapper and needs the names the first header would have provided.
 //
-// zluda_ptx_impl.cpp turns out to need exactly three things out of all that,
+// zluda_ptx_impl.cpp turns out to need only a few things out of all that,
 // and each is reproduced below as HIP itself defines it -- not approximated.
 
 #pragma once
@@ -24,6 +24,10 @@
 namespace std {
 __device__ inline float fabs(float __x) { return ::fabsf(__x); }
 __device__ inline float fma(float __x, float __y, float __z) { return ::fmaf(__x, __y, __z); }
+// The classification functions, for float, as __clang_hip_cmath.h has them: the builtins.
+__device__ inline bool isinf(float __x) { return ::__builtin_isinf(__x); }
+__device__ inline bool isnan(float __x) { return ::__builtin_isnan(__x); }
+__device__ inline bool signbit(float __x) { return ::__builtin_signbit(__x); }
 } // namespace std
 
 // The handler behind PTX's assertfail. HIP declares __assert_fail on device

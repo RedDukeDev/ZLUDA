@@ -1,7 +1,7 @@
 [submodule "ext/llvm-project"]
 	path = ext/llvm-project
 	url = https://github.com/RedDukeDev/llvm-project.git
-	branch = main
+	branch = rocm7101
 	shallow = true
 [submodule "ext/HiGHS"]
 	path = ext/HiGHS
